@@ -27,7 +27,7 @@ cd "$GAMEDIR/gamedata"
 MONODIR="$HOME/mono"
 MONOFILE="$controlfolder/libs/mono-6.12.0.122-aarch64.squashfs"
 $ESUDO mkdir -p "$MONODIR"
-$ESUDO umount "$MONODIR" 2>/dev/null || true
+$ESUDO umount "$MONODIR" 2>/dev/null
 $ESUDO mount "$MONOFILE" "$MONODIR"
 MONO="$MONODIR/bin/mono"
 if [ ! -x "$MONO" ]; then
@@ -57,6 +57,7 @@ rm -f steam_api64.dll EOSSDK-Win64-Shipping.dll libtheorafile.dll
 # Copy supplied files to gamedata
 cp -f "$GAMEDIR/ParisEngine.dll.config" "$GAMEDIR/gamedata/ParisEngine.dll.config"
 cp -f "$GAMEDIR/NBug.config" "$GAMEDIR/gamedata/NBug.config"
+cp -f "$GAMEDIR/NLog.Retail.config" "$GAMEDIR/gamedata/NLog.Retail.config"
 
 # Environment
 export MONO_IOMAP=all
@@ -69,15 +70,21 @@ export MONO_LOG_LEVEL=warning
 export FNA3D_FORCE_DRIVER="OpenGL"
 export FNA3D_OPENGL_FORCE_ES3=1
 
-# Detect if user added a fresh game copy after a prior patch
+# Re-patch when the game files or the port's engine patches changed since the last patch
 STAMPFILE="$GAMEDIR/gamedata/.mci_patched"
 if [ -f "$STAMPFILE" ]; then
     if [ ! -s "$STAMPFILE" ] && grep -aq MonoModAdded Game.exe && grep -aq MonoModAdded ParisEngine.dll; then
-        md5sum Game.exe ParisEngine.dll > "$STAMPFILE"
+        md5sum Game.exe ParisEngine.dll ../patches/*.mm.dll > "$STAMPFILE"
     fi
-    if [ "$(md5sum Game.exe ParisEngine.dll 2>/dev/null)" != "$(cat "$STAMPFILE" 2>/dev/null)" ]; then
-        echo "Game files changed since last patch - re-running the patcher."
-        rm -f "$STAMPFILE" "$GAMEDIR/gamedata/.repack_done"
+    if [ "$(md5sum Game.exe ParisEngine.dll ../patches/*.mm.dll 2>/dev/null)" != "$(cat "$STAMPFILE" 2>/dev/null)" ]; then
+        # Only fresh game files need their textures re-encoded; a port update just re-patches
+        if [ "$(md5sum Game.exe ParisEngine.dll 2>/dev/null)" != "$(head -n 2 "$STAMPFILE" 2>/dev/null)" ]; then
+            echo "Game files changed since last patch - re-running the patcher."
+            rm -f "$GAMEDIR/gamedata/.repack_done"
+        else
+            echo "Port patches changed since last patch - re-running the patcher."
+        fi
+        rm -f "$STAMPFILE"
     fi
 fi
 
@@ -85,8 +92,10 @@ fi
 if [ ! -f "$GAMEDIR/patchlog.txt" ] || [ ! -f "$GAMEDIR/gamedata/.mci_patched" ]; then
     if [ -f "$controlfolder/utils/patcher.txt" ]; then
         export PATCHER_FILE="$GAMEDIR/tools/patchscript"
-        # Ask about the intro re-encode once, only while it is still undecided.
-        [ -f "$GAMEDIR/gamedata/.intro_done" ] || export PATCHER_QUESTIONS="$GAMEDIR/tools/questions.lua"
+        # Ask only the setup questions not answered yet
+        [ -f "$GAMEDIR/gamedata/.intro_done" ] || export MCI_ASK_INTRO=1
+        [ -f "$GAMEDIR/gamedata/.aot_choice" ] || export MCI_ASK_AOT=1
+        [ -n "$MCI_ASK_INTRO$MCI_ASK_AOT" ] && export PATCHER_QUESTIONS="$GAMEDIR/tools/questions.lua"
         export PATCHER_GAME="$(basename "${0%.*}")"
         export PATCHER_TIME="5 to 40 minutes depending on device"
         export MONODIR MONO
@@ -108,18 +117,20 @@ fi
 
 # Display loading splash
 chmod +x "$GAMEDIR/tools/splash"
-[ "$CFW_NAME" == "muOS" ] && $ESUDO "$GAMEDIR/tools/splash" "$GAMEDIR/splash.png" 1 
+[ "$CFW_NAME" == "muOS" ] && $ESUDO "$GAMEDIR/tools/splash" "$GAMEDIR/splash.png" 1
 $ESUDO "$GAMEDIR/tools/splash" "$GAMEDIR/splash.png" 80000 &
 
 # Face-button layout
 if [ -f "$GAMEDIR/swapabxy.txt" ]; then
     chmod +x "$GAMEDIR/tools/swapabxy.py"
     if [ -n "$SDL_GAMECONTROLLERCONFIG_FILE" ] && [ -f "$SDL_GAMECONTROLLERCONFIG_FILE" ]; then
-        cat "$SDL_GAMECONTROLLERCONFIG_FILE" | "$GAMEDIR/tools/swapabxy.py" > "$GAMEDIR/gamecontrollerdb_swapped.txt"
-        export SDL_GAMECONTROLLERCONFIG_FILE="$GAMEDIR/gamecontrollerdb_swapped.txt"
+        "$GAMEDIR/tools/swapabxy.py" < "$SDL_GAMECONTROLLERCONFIG_FILE" > "$GAMEDIR/gamecontrollerdb_swapped.txt" \
+            && [ -s "$GAMEDIR/gamecontrollerdb_swapped.txt" ] \
+            && export SDL_GAMECONTROLLERCONFIG_FILE="$GAMEDIR/gamecontrollerdb_swapped.txt"
     fi
     if [ -n "$SDL_GAMECONTROLLERCONFIG" ]; then
-        export SDL_GAMECONTROLLERCONFIG="`echo "$SDL_GAMECONTROLLERCONFIG" | "$GAMEDIR/tools/swapabxy.py"`"
+        swapped="$(echo "$SDL_GAMECONTROLLERCONFIG" | "$GAMEDIR/tools/swapabxy.py")"
+        [ -n "$swapped" ] && export SDL_GAMECONTROLLERCONFIG="$swapped"
     fi
 fi
 
@@ -133,12 +144,25 @@ if command -v aplay >/dev/null 2>&1 \
     echo "Audio: exposed a hinted pipewire 'default' via ~/.asoundrc"
 fi
 
+# Point FMOD at the CFW's default ALSA device when there is no PulseAudio server.
+if ! pidof pipewire-pulse pulseaudio >/dev/null 2>&1; then
+    for conf in /usr/share/alsa/alsa.conf /etc/alsa/alsa.conf; do
+        if [ -f "$conf" ]; then
+            export ALSA_CONFIG_PATH="$conf:$GAMEDIR/tools/asound-mci.conf"
+            export FMOD_ALSA_DEVICE=mci_default
+            echo "Audio: FMOD uses ALSA 'default' via mci_default"
+            break
+        fi
+    done
+fi
+
 # Run it
 $GPTOKEYB "mono" -c "$GAMEDIR/mci.gptk" &
 pm_platform_helper "$MONO" >/dev/null
-$TASKSET "$MONO" -O=all "Game.exe" -forcedraw
+"$MONO" -O=all "Game.exe" -forcedraw
 
 # Cleanup
+$ESUDO pkill -9 -f "$GAMEDIR/tools/splash" 2>/dev/null
 [ "$MCI_ASOUNDRC" = "1" ] && rm -f "$HOME/.asoundrc"
 $ESUDO umount "$MONODIR" 2>/dev/null
 pm_finish

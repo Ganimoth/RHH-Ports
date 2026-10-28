@@ -26,7 +26,7 @@ docker run --rm --platform linux/aarch64 \
   -v "$PWD/FNA3D:/host" ubuntu:24.04 bash /host/build_fna3d_astc.sh
 ```
 
-Clones FNA3D 24.04, applies `fna3d-astc-r8.patch` (adds ASTC 4x4/5x5/6x6/8x8 + R8 surface formats, GL/GLES only), disables the Vulkan driver (the port forces `FNA3D_FORCE_DRIVER=OpenGL`), builds, and drops `libFNA3D.so.0.24.04` next to the script. Copy it to `<port>/libs/libFNA3D.so.0`.
+Clones FNA3D 24.04, applies `fna3d-astc-r8.patch` (adds ASTC 4x4/5x5/6x6/8x8 + R8 surface formats, GL/GLES only) and `mojoshader-glsles3-highp.patch` (highp floats in GLSL ES 3 fragment shaders), disables the Vulkan driver (the port forces `FNA3D_FORCE_DRIVER=OpenGL`), builds, and drops `libFNA3D.so.0.24.04` next to the script. Copy it to `<port>/libs/libFNA3D.so.0`.
 
 ## 2. Mixins + MCIRepacker (managed, architecture-independent)
 
@@ -59,7 +59,6 @@ Deploy the two: `*.mm.dll` to `<port>/patches/`, `MCIRepacker.exe` goes to `<por
 Apply the mixins to pristine copies exactly as the device patchscript will. MonoMod auto-discovers `<target>.*.mm.dll` beside the target; both must exit 0 and emit a `MONOMODDED_*`:
 
 ```bash
-cp ParisEngine.dll pe_target.dll && mv pe_target.dll ParisEngine.dll    # mixin sits beside it
 MONOMOD_DEPDIRS=.:/usr/lib/mono/4.5 mono MonoMod.exe ParisEngine.dll    # -> MONOMODDED_ParisEngine.dll
 cp -f MONOMODDED_ParisEngine.dll ParisEngine.dll                        # Game mixin needs the patched engine
 MONOMOD_DEPDIRS=.:/usr/lib/mono/4.5 mono MonoMod.exe Game.exe           # -> MONOMODDED_Game.exe

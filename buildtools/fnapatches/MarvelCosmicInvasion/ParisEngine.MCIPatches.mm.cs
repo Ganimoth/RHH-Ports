@@ -7,8 +7,8 @@ using MonoMod;
 using Paris.Engine;
 using Paris.Engine.Helper;
 using Paris.Engine.Input;
-using Paris.Engine.Localisation;
 using Paris.Engine.Leaderboards;
+using Paris.Engine.Localisation;
 using Paris.Engine.Stats;
 
 // Split asset preloading so GL work stays on the main thread
@@ -20,6 +20,9 @@ namespace Paris.Engine.Context
 		private volatile ContextManager.PreloadingState _preloadingState;
 		private List<Thread> mGlobalLoadingThreads;
 
+		private ContextManager.PreloadingState mci_preloaded;
+		private static readonly object mci_preloadLock = new object();   // static: MonoMod drops instance field initializers
+
 		public patch_ContextManager(Game game) : base(game) { }
 
 		[MonoModReplace]
@@ -30,30 +33,49 @@ namespace Paris.Engine.Context
 				return;
 			}
 			// No texture data, so these are safe to load in parallel on background threads
-			foreach (Action action in new Action[]
+			Action[] actions = new Action[] { this.PreloadAudio, this.CacheJsonFiles, this.CacheReflectionInfo, this.PreloadPoolObjects };
+			ContextManager.PreloadingState[] flags = new ContextManager.PreloadingState[]
 			{
-				new Action(this.PreloadAudio),
-				new Action(this.CacheJsonFiles),
-				new Action(this.CacheReflectionInfo),
-				new Action(this.PreloadPoolObjects)
-			})
+				ContextManager.PreloadingState.Audio,
+				ContextManager.PreloadingState.JsonFiles,
+				ContextManager.PreloadingState.Reflection,
+				ContextManager.PreloadingState.PoolManager
+			};
+			for (int i = 0; i < actions.Length; i++)
 			{
-				Thread thread = new Thread(new ThreadStart(action.Invoke));
+				Action action = actions[i];
+				ContextManager.PreloadingState flag = flags[i];
+				Thread thread = new Thread(() =>
+				{
+					action();
+					this.MCI_MarkPreloaded(flag);
+				});
 				thread.Priority = ThreadPriority.BelowNormal;
 				thread.IsBackground = true;
 				thread.Name = string.Format("Preload : {0}", action.Method.Name);
 				this.mGlobalLoadingThreads.Add(thread);
 				thread.Start();
 			}
-			// Global content creates GL, so it runs on the main/render thread -
-			// created directly in the main context, no worker marshaling.
+			// Global content creates GL objects, so it loads here on the main thread
 			this.LoadGlobalContent();
+			this.MCI_MarkPreloaded(ContextManager.PreloadingState.GlobalAsset);
 		}
 
 		// Bridge for the Game.exe StartInit patch
 		public void MCI_FinishPreload()
 		{
-			this._preloadingState |= ContextManager.PreloadingState.CustomPreloaders;
+			this.MCI_MarkPreloaded(ContextManager.PreloadingState.CustomPreloaders);
+		}
+
+		// The stock loaders set their flag with an unlocked |=, which can drop another thread's
+		// flag and hang boot; each loader re-applies every finished flag once it returns
+		private void MCI_MarkPreloaded(ContextManager.PreloadingState flag)
+		{
+			lock (mci_preloadLock)
+			{
+				this.mci_preloaded |= flag;
+				this._preloadingState |= this.mci_preloaded;
+			}
 		}
 	}
 }
@@ -63,6 +85,8 @@ namespace Paris.Engine.Cutscenes
 {
 	class patch_VideoContext : VideoContext
 	{
+		private Microsoft.Xna.Framework.Media.VideoPlayer _videoPlayer;
+
 		public extern void orig_Init();
 		public override void Init()
 		{
@@ -83,6 +107,22 @@ namespace Paris.Engine.Cutscenes
 				}
 			}
 			orig_Init();
+		}
+
+		// VideoPlayer throws without an SDL audio device after it already reports Playing;
+		// stopping it keeps Render off the missing texture and the next tick ends the context
+		public extern void orig_StatePlaying(FSM.StateStep stateStep, float deltaTime);
+		public void StatePlaying(FSM.StateStep stateStep, float deltaTime)
+		{
+			try
+			{
+				orig_StatePlaying(stateStep, deltaTime);
+			}
+			catch (Microsoft.Xna.Framework.Audio.NoAudioHardwareException)
+			{
+				Console.WriteLine("[MCI] Video: SDL has no audio device, skipping '" + VideoContext.VideoPath + "'");
+				this._videoPlayer.Stop();
+			}
 		}
 	}
 }
@@ -122,6 +162,7 @@ namespace Paris.Engine.Input
 
 namespace Paris.Engine.Audio
 {
+	// Release FMOD event instances left stopped, and recreate one on the next Play
 	class patch_SoundEventInstance : SoundEventInstance
 	{
 		private FMOD.Studio.EventInstance _instance;
@@ -131,7 +172,7 @@ namespace Paris.Engine.Audio
 		private bool mci_released;
 		private float mci_idle;
 
-		private const float MCI_GRACE = 10f; // Tunable
+		private const float MCI_GRACE = 10f; // seconds stopped before the instance is released
 
 		public patch_SoundEventInstance(int soundEventID) : base(soundEventID) { }
 
@@ -163,6 +204,50 @@ namespace Paris.Engine.Audio
 		public extern void orig_Play();
 		public new void Play()
 		{
+			this.MCI_Revive();
+			orig_Play();
+		}
+
+		// Settings made before Play must land on the instance that will play
+		public extern void orig_SetParameter(string name, float value);
+		public new void SetParameter(string name, float value)
+		{
+			this.MCI_Revive();
+			orig_SetParameter(name, value);
+		}
+
+		public extern void orig_ResetParameter(string name);
+		public new void ResetParameter(string name)
+		{
+			this.MCI_Revive();
+			orig_ResetParameter(name);
+		}
+
+		public extern void orig_ResetParameters();
+		public new void ResetParameters()
+		{
+			this.MCI_Revive();
+			orig_ResetParameters();
+		}
+
+		public extern float orig_get_Volume();
+		public extern void orig_set_Volume(float value);
+		public new float Volume
+		{
+			get { return orig_get_Volume(); }
+			set { this.MCI_Revive(); orig_set_Volume(value); }
+		}
+
+		public extern bool orig_get_IsPaused();
+		public extern void orig_set_IsPaused(bool value);
+		public new bool IsPaused
+		{
+			get { return orig_get_IsPaused(); }
+			set { this.MCI_Revive(); orig_set_IsPaused(value); }
+		}
+
+		private void MCI_Revive()
+		{
 			if (this.mci_released)
 			{
 				this.Description.createInstance(out this._instance);
@@ -172,7 +257,6 @@ namespace Paris.Engine.Audio
 				this.mci_released = false;
 			}
 			this.mci_idle = 0f;
-			orig_Play();
 		}
 	}
 }
@@ -192,13 +276,11 @@ namespace Paris.Engine.Stats
 	{
 		public new void Init()
 		{
-			// disabled
 		}
 	}
 }
 
-// Halt networking, EOSSDK is stubbed.
-// (The LAN build needs the real Disconnect/ChangeLobbyLocked - its lobby calls are shimmed.)
+// Halt networking, EOSSDK is stubbed (the LAN build needs the real Disconnect and ChangeLobbyLocked)
 #if !MCI_LAN
 namespace Paris.Engine.Networking
 {
@@ -215,9 +297,7 @@ namespace Paris.Engine.Networking
 }
 #endif
 
-// Halt EpicHelper, EOSSDK is stubbed.
-// (The LAN build defines MCI_LAN and supplies its own patch_EpicHelper that un-gates
-// EOS onto the clean-room LAN backend instead of stubbing it out.)
+// Halt EpicHelper, EOSSDK is stubbed (the LAN build supplies its own patch_EpicHelper)
 #if !MCI_LAN
 namespace Paris.Engine
 {
@@ -232,7 +312,7 @@ namespace Paris.Engine
 }
 #endif
 
-// Mono 6.12 LLVM AOT miscompiles Vector3.CatmullRom/Hermite, 
+// Mono 6.12 LLVM AOT miscompiles Vector3.CatmullRom/Hermite,
 // so recompute in scalar double
 namespace Paris.Engine.Effects
 {
@@ -283,6 +363,7 @@ namespace Paris.Engine.Effects
 	}
 }
 
+// Leaderboards are Steam-only, so construct them empty
 [MonoModPatch("Paris.Engine.Leaderboards.Leaderboard")]
 public class patch_Leaderboard
 {
@@ -312,6 +393,32 @@ namespace Paris.Engine.Graphics.Shaders
 	}
 }
 
+// GalactusDebris lists a texture the game doesn't ship, and stock stops there before loading the
+// palette; stand texture 0 in for it, the one TryGetDrawArguments falls back to past the end
+namespace Paris.Engine.Graphics.Animations
+{
+	class patch_Animator2dData : Animator2dData
+	{
+		public extern void orig_LoadTextures(string path, bool isReload);
+		public new void LoadTextures(string path, bool isReload = false)
+		{
+			while (true)
+			{
+				try
+				{
+					orig_LoadTextures(path, isReload);
+					return;
+				}
+				catch (Microsoft.Xna.Framework.Content.ContentLoadException) when (this.Textures.Count > 0 && this.Textures.Count < this.TextureFilenames.Count)
+				{
+					this.Textures.Add(this.Textures[0]);
+					isReload = false;   // a reload clears Textures first, which would drop the stand-in
+				}
+			}
+		}
+	}
+}
+
 // Grow exhausted pools by one object on demand
 // The stock path builds a 20% batch inline mid-frame, stalling heavy scenes
 namespace Paris.Engine.Scene
@@ -323,13 +430,15 @@ namespace Paris.Engine.Scene
 		{
 			if (!Paris.Engine.Context.ContextManager.Singleton.EditorMode)
 			{
-				this.MCI_EnsureAvailable(actorTemplate, forceGuid, global);
+				this.MCI_EnsureAvailable(actorTemplate, forceGuid, global, indexAuthority);
 			}
 			return this.orig_SpawnObject(actorTemplate, position, forceGuid, sendToNetwork, reliable, global, indexAuthority);
 		}
 
-		private void MCI_EnsureAvailable(string actorTemplate, Guid forceGuid, bool global)
+		// An authority may only take slots where i % MaxPlayers == indexAuthority (stock SpawnObject)
+		private void MCI_EnsureAvailable(string actorTemplate, Guid forceGuid, bool global, int indexAuthority)
 		{
+			int players = Math.Max(1, Paris.Engine.Data.EngineSettings.Singleton.MaxPlayers);
 			bool needOne = true;
 			int count = 0;
 			Monitor.Enter(this._lock);
@@ -337,11 +446,12 @@ namespace Paris.Engine.Scene
 			if (this._pools.TryGetValue(actorTemplate, out list))
 			{
 				count = list.Count;
-				foreach (Paris.Engine.Graphics.Playfield.GameObjectData d in list)
+				for (int i = 0; i < list.Count; i++)
 				{
-					// A disposed object satisfies the spawn; so does a live
-					// object already carrying the forced guid (stock reuses it)
-					if (d.GameObject.Disposed || (forceGuid != Guid.Empty && d.GameObject.Id == forceGuid))
+					// A live object already carrying the forced guid satisfies the spawn too (stock reuses it)
+					Paris.Engine.Graphics.Playfield.GameObjectData d = list[i];
+					if ((forceGuid != Guid.Empty && d.GameObject.Id == forceGuid)
+						|| (d.GameObject.Disposed && (indexAuthority < 0 || i % players == indexAuthority)))
 					{
 						needOne = false;
 						break;
@@ -354,12 +464,23 @@ namespace Paris.Engine.Scene
 				return;
 			}
 			System.Diagnostics.Stopwatch stopwatch = System.Diagnostics.Stopwatch.StartNew();
-			this.MCI_ConstructOne(actorTemplate, global);
-			Console.WriteLine(string.Concat(new string[]
+			int built = 0;
+			do
 			{
-				"[MCI] Pool '", actorTemplate, "' exhausted at ", count.ToString(),
-				"; built 1 in ", stopwatch.ElapsedMilliseconds.ToString(), "ms."
-			}));
+				this.MCI_ConstructOne(actorTemplate, global);
+				built++;
+			}
+			while (indexAuthority >= 0 && built < players && (this.MCI_PoolCount(actorTemplate) - 1) % players != indexAuthority);
+			Console.WriteLine("[MCI] Pool '" + actorTemplate + "' exhausted at " + count + "; built " + built + " in " + stopwatch.ElapsedMilliseconds + "ms.");
+		}
+
+		private int MCI_PoolCount(string actorTemplate)
+		{
+			Monitor.Enter(this._lock);
+			List<Paris.Engine.Graphics.Playfield.GameObjectData> list;
+			int count = this._pools.TryGetValue(actorTemplate, out list) ? list.Count : 0;
+			Monitor.Exit(this._lock);
+			return count;
 		}
 
 		// Mirrors AddPoolInternal's per-object steps, minus _poolStack so the stock

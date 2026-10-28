@@ -1,7 +1,5 @@
 #!/bin/bash
-# Set GAMEDIR to the current directory and set logfile
-# (the launcher cds to gamedata/ before sourcing patcher.txt, so $PWD is the
-# gamedata dir and the port root is one level up)
+# The launcher cds into gamedata/ before sourcing patcher.txt, so $PWD is gamedata
 GAMEDIR="$PWD"
 PORTDIR="$(cd "$GAMEDIR/.." && pwd)"
 LOGFILE="$PORTDIR/patchlog.txt"
@@ -9,9 +7,7 @@ LOGERR="$PORTDIR/patcherr.txt"
 
 # Redirect output and error to the log file
 rm -f "$LOGERR"
-# Save the patcher pipe (original stdout) on fd 3 before redirecting stdout
-# through tee. This lets emit_fail_msg send dialog overrides straight to the
-# patcher GUI without them appearing in patchlog.txt.
+# fd 3 keeps the patcher GUI's pipe, so emit_fail_msg's dialog override stays out of patchlog.txt
 exec 3>&1
 > "$LOGFILE" && exec > >(tee "$LOGFILE") 2>&1
 
@@ -118,6 +114,7 @@ aot_one() {
     local asm="$1" step="$2" start now pid rc
     echo "Optimizing $asm ($step) with LLVM..."
     start=$(date +%s)
+    rm -f "$asm.so"
     "$MONO" -O=all --aot=llvm "$asm" &
     pid=$!
     while kill -0 "$pid" 2>/dev/null; do
@@ -153,6 +150,23 @@ aot_assemblies() {
         emit_fail_msg "Patching failed while optimizing Game.exe - this device's Mono could not ahead-of-time compile the game. See patcherr.txt."
         return 1
     fi
+}
+
+# Optional AOT of the game's other managed deps (AOT_EXTRA, kept in .aot_choice for
+# later re-patches). A failure just leaves that assembly JIT-compiled.
+aot_extras() {
+    local asm
+    [ -n "$AOT_EXTRA" ] || AOT_EXTRA="$(cat .aot_choice 2>/dev/null)"
+    [ -n "$AOT_EXTRA" ] || AOT_EXTRA=1
+    echo "$AOT_EXTRA" > .aot_choice
+    if [ "$AOT_EXTRA" != "1" ]; then
+        echo "Extra optimization declined, skipping."
+        return 0
+    fi
+    for asm in "$PORTDIR/dlls/FNA.dll" Newtonsoft.Json.dll ParisSerializers.dll Ionic.Zlib.dll NVorbis.dll; do
+        [ -f "$asm" ] || continue
+        aot_one "$asm" "extra" || echo "  $(basename "$asm") stays JIT-compiled."
+    done
 }
 
 repack_textures() {
@@ -206,9 +220,8 @@ finalize() {
         echo "Missing AOT images after compile."
         return 1
     fi
-    # Stamp the woven assemblies' md5s; the launcher compares against this to
-    # detect a game update and force a clean re-patch.
-    md5sum Game.exe ParisEngine.dll > .mci_patched || return 1
+    # The launcher re-patches when these stop matching
+    md5sum Game.exe ParisEngine.dll ../patches/*.mm.dll > .mci_patched || return 1
 }
 
 cleanup() {
@@ -223,6 +236,7 @@ process_game() {
     echo "Applying engine patches..."
     patch_assemblies || return 1
     aot_assemblies || return 1
+    aot_extras
     echo "Re-encoding textures for low memory use (the long part)..."
     repack_textures || return 1
     echo "Preparing the intro movie..."

@@ -2,6 +2,10 @@
 
 Buy MARVEL Cosmic Invasion on [Steam](https://store.steampowered.com/app/2753970/) and copy the **entire** game folder (Windows install) into `marvelcosmicinvasion/gamedata/`.
 
+## Setup choices
+
+Setup asks whether to re-encode the intro movie and whether to spend extra time so the game loads faster and stutters less. To answer again, delete `gamedata/.mci_patched` and the matching `gamedata/.intro_done` or `gamedata/.aot_choice`, then launch the port.
+
 ## LAN co-op
 
 This port replaces the game's Epic Online Services matchmaking with local-network play. Devices with this port installed can play co-op together (up to four players):
@@ -16,9 +20,9 @@ Player names are the device hostnames. Discovery is UDP broadcast on port 55123,
 
 ## Notes
 
-DLC is packaged with the base game and is enabled with an entitlement check. Therefore, this port **cannot** distinguish between game data with dlc purchased vs not purchased. In accordance, DLC is left disabled.
+DLC is packaged with the base game and is enabled with an entitlement check. Therefore, this port **cannot** distinguish between game data with DLC purchased vs not purchased. In accordance, DLC is left disabled.
 
-This port has been tested from first run patching to playable runtime on a H700 device with a Mali-G31 GPU. As always with ports, for the best experience, play with a stronger device.
+This port has been tested from first run patching to playable runtime on an H700 device with a Mali-G31 GPU. As always with ports, for the best experience, play with a stronger device.
 
 ## Thanks
 
@@ -32,7 +36,7 @@ Port by Jeod. The engine patches, launcher, patch scripts, and the bundled FNA3D
 - **FFmpeg** and the **Xiph.Org** codecs (libtheora, libogg, libvorbis): the bundled `tools/ffmpeg` is an RHH slim LGPL build that links them to re-encode the intro video.
 - **Arm**: the astc-encoder library, embedded in the bundled `libastcUtil.so`.
 - **DotNetZip** contributors.
-- **Firelight Technologies Pty Ltd**: FMOD Studio audio engine, bundled under its licence terms.
+- **Firelight Technologies Pty Ltd**: FMOD Studio audio engine, bundled under its license terms.
 - **K-Dog**: the original swapabxy tool (extended by RHH).
 - **Mono Project**: the runtime.
 

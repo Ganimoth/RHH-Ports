@@ -1,37 +1,29 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Jeod
 //
-// ParisEngine.EOSLan.mm.cs - EOS-over-LAN shim for MARVEL Cosmic Invasion.
-//
 // Replaces Epic Online Services with a LAN backend (libEOSSDK-LAN.cs) so two devices on
-// the same network can play co-op. No Epic account, no internet, no native EOSSDK.
-// Written clean-room against the game's own EOS C# wrapper (Epic.OnlineServices.*).
-// Fully isolated from the real services: nothing here contacts Epic or Steam, and all
-// traffic stays on the local subnet - real online sessions can't be touched from here.
+// the same network can play co-op. No Epic account, no internet, no native EOSSDK
+// Written clean-room against the game's own EOS C# wrapper (Epic.OnlineServices.*)
+// Nothing here contacts Epic or Steam, and all traffic stays on the local subnet
 //
-// MciLan holds the identity side-table (puid string <-> fake handle) and the callback
-// queue pumped by Platform.Tick. LobbyBridge glues the EOS lobby/P2P surface onto the
-// LAN core. The patch_ classes replace the high-level wrapper methods; the wrapper types
-// are sealed, so each patch inherits Handle and binds by name via [MonoModPatch].
-//
-// Built together with the base ship mixin and the LAN core using -d:MCI_LAN (which also
-// compiles out the base mixin's EOS/networking no-ops). See BUILD.md section 4.
+// The wrapper types are sealed, so each patch inherits Handle and binds by name with
+// [MonoModPatch]. Built with the base mixin and the LAN core under -d:MCI_LAN, see
+// BUILD.md section 4
 using System;
 using System.Collections.Generic;
 using MonoMod;
 using Epic.OnlineServices;
-using Epic.OnlineServices.Platform;
+using Epic.OnlineServices.Auth;
 using Epic.OnlineServices.Connect;
 using Epic.OnlineServices.Lobby;
-using Epic.OnlineServices.Auth;
-using Epic.OnlineServices.Presence;
 using Epic.OnlineServices.P2P;
-using Paris.Engine;
+using Epic.OnlineServices.Platform;
+using Epic.OnlineServices.Presence;
 using Paris.Engine.EOSLan;
 
 namespace Paris.Engine.EOSLan
 {
-	// Identity side-table plus the Tick-pumped callback queue, shared by every shim.
+	// puid string <-> fake handle side-table, and the callback queue Platform.Tick pumps
 	static class MciLan
 	{
 		static readonly object gate = new object();
@@ -39,14 +31,12 @@ namespace Paris.Engine.EOSLan
 		static readonly Dictionary<IntPtr, string> handleToId = new Dictionary<IntPtr, string>();
 		static long nextHandle = 0x4000L;   // start high so minted handles never look like a small real pointer
 		static readonly Queue<Action> callbacks = new Queue<Action>();
+		static string displayName;
 		static string localId;
 
-		// One non-null sentinel for the Platform + interface objects. The game only ever
-		// compares those for null, so a single value suffices.
+		// The game only null-checks the Platform and interface handles, so one sentinel serves them all
 		public static readonly IntPtr FakeHandle = new IntPtr(1);
 
-		// Stable local identity, seeded from the hostname so two devices differ.
-		// DisplayName is what players see; LocalId is the ProductUserId string.
 		public static string DisplayName
 		{
 			get
@@ -60,7 +50,6 @@ namespace Paris.Engine.EOSLan
 				return displayName;
 			}
 		}
-		static string displayName;
 
 		public static string LocalId
 		{
@@ -68,7 +57,7 @@ namespace Paris.Engine.EOSLan
 			{
 				if (localId == null)
 				{
-					localId = "LAN-" + DisplayName;
+					localId = MciLanNet.NewLocalId(DisplayName);
 				}
 				return localId;
 			}
@@ -95,7 +84,7 @@ namespace Paris.Engine.EOSLan
 			lock (gate) { string s; return handleToId.TryGetValue(h, out s) ? s : null; }
 		}
 
-		// Queue a callback to fire on the next Platform.Tick (EOS-style async delivery).
+		// Runs cb on the next Platform.Tick
 		public static void Post(Action cb) { lock (gate) callbacks.Enqueue(cb); }
 
 		public static void Pump()
@@ -113,7 +102,7 @@ namespace Paris.Engine.EOSLan
 
 namespace Epic.OnlineServices
 {
-	// ProductUserId backed by the side-table: FromString/ToString round-trip, minted ids are valid.
+	// Back ProductUserId with the MciLan side-table
 	[MonoModPatch("Epic.OnlineServices.ProductUserId")]
 	class patch_ProductUserId : Handle
 	{
@@ -141,7 +130,7 @@ namespace Epic.OnlineServices
 
 namespace Epic.OnlineServices.Platform
 {
-	// Platform: init/create succeed with the sentinel handle; Tick() pumps our callbacks.
+	// Hand out the sentinel handle, and pump the callback queue on Tick
 	[MonoModPatch("Epic.OnlineServices.Platform.PlatformInterface")]
 	class patch_PlatformInterface : Handle
 	{
@@ -217,15 +206,15 @@ namespace Epic.OnlineServices.Platform
 			MciLan.Pump();
 		}
 
-		// NetworkManager.Tick polls this every frame while connected; the LAN is always up.
+		// NetworkManager.Tick polls this every frame while connected; the LAN is always up
 		[MonoModReplace]
 		public NetworkStatus GetNetworkStatus()
 		{
 			return NetworkStatus.Online;
 		}
 
-		// Exit path (Uninit -> Release + Shutdown). The stub SDK lacks EOS_Shutdown, and an
-		// exception here would mask whatever was unwinding through Game.Dispose.
+		// EpicHelper.Uninit calls these on exit. The stub SDK lacks EOS_Shutdown, and an
+		// exception here would mask whatever was unwinding through Game.Dispose
 		[MonoModReplace]
 		public void Release()
 		{
@@ -241,7 +230,7 @@ namespace Epic.OnlineServices.Platform
 
 namespace Epic.OnlineServices.Connect
 {
-	// Connect: logins succeed immediately as the local product user, delivered on Tick.
+	// Log in at once as the local product user, delivered on Tick
 	[MonoModPatch("Epic.OnlineServices.Connect.ConnectInterface")]
 	class patch_ConnectInterface : Handle
 	{
@@ -280,7 +269,7 @@ namespace Epic.OnlineServices.Connect
 		[MonoModReplace]
 		public ulong AddNotifyLoginStatusChanged(ref AddNotifyLoginStatusChangedOptions options, object clientData, OnLoginStatusChangedCallback notification)
 		{
-			// No status transitions in the LAN backend yet; a non-zero id keeps callers happy.
+			// No status changes on LAN yet, and a nonzero id keeps callers happy
 			return 1UL;
 		}
 
@@ -290,7 +279,7 @@ namespace Epic.OnlineServices.Connect
 			return 1UL;
 		}
 
-		// Identity mappings resolve trivially on LAN - every puid string is already local.
+		// Every puid string is already local, so mappings resolve at once
 		[MonoModReplace]
 		public void QueryProductUserIdMappings(ref QueryProductUserIdMappingsOptions options, object clientData, OnQueryProductUserIdMappingsCallback completionDelegate)
 		{
@@ -313,8 +302,8 @@ namespace Epic.OnlineServices.Connect
 			});
 		}
 
-		// NotFound on purpose: Success would route name resolution into the Epic-account
-		// path (native UserInfo). Names come from lobby member attributes instead.
+		// NotFound on purpose: Success would route name resolution into the Epic account
+		// path (native UserInfo). Names come from lobby member attributes instead
 		[MonoModReplace]
 		public Result GetProductUserIdMapping(ref GetProductUserIdMappingOptions options, out Utf8String outBuffer)
 		{
@@ -332,9 +321,8 @@ namespace Epic.OnlineServices.Connect
 
 namespace Paris.Engine
 {
-	// Un-gate EpicHelper: skip the real EOS+Steam startup (needs a Steam ticket / Epic
-	// account we don't have) and log straight in with a device-local identity.
-	// Replaces the base mixin's no-op, which is #if'd out under MCI_LAN.
+	// Log straight in with a device-local identity, skipping the EOS and Steam startup
+	// (no Steam ticket or Epic account). Replaces the base mixin's no-op under MCI_LAN
 	[MonoModPatch("Paris.Engine.EpicHelper")]
 	static class patch_EpicHelper
 	{
@@ -348,7 +336,7 @@ namespace Paris.Engine
 			EpicHelper._initialized = true;
 			EpicHelper.Interface = new PlatformInterface(MciLan.FakeHandle);
 			Console.WriteLine("[EOSLAN] Init: fake platform ready");
-			EpicHelper.Login(false);   // LAN: no account selection, log in immediately
+			EpicHelper.Login(false);
 		}
 
 		[MonoModReplace]
@@ -365,103 +353,38 @@ namespace Paris.Engine
 	}
 }
 
-// LAN lobby adapter: Lobby/LobbyDetails/LobbySearch/LobbyModification over the LAN
-// core, plus Presence/P2P so the multiplayer flow never touches the native SDK
 namespace Paris.Engine.EOSLan
 {
-	// Attributes staged on a LobbyModification, applied to the lobby on UpdateLobby.
+	// A LobbyModification's staged changes, applied on UpdateLobby
 	class ModStage
 	{
-		public readonly System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, LanAttr>> Attrs =
-			new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, LanAttr>>();
-		public readonly System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, LanAttr>> MemberAttrs =
-			new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, LanAttr>>();
+		public readonly List<KeyValuePair<string, LanAttr>> Attrs = new List<KeyValuePair<string, LanAttr>>();
+		public readonly List<KeyValuePair<string, LanAttr>> MemberAttrs = new List<KeyValuePair<string, LanAttr>>();
 		public string Bucket;
 		public uint? Max;
 	}
 
-	// Glue between the EOS lobby/P2P surface and the LAN core: owns the net instance,
-	// mints handles, stores notify callbacks, re-posts net events onto Platform.Tick.
+	// Owns the LAN net instance and the lobby handles, and re-posts net events onto Platform.Tick
 	static class LobbyBridge
 	{
 		static readonly object gate = new object();
 		static MciLanNet net;
 		static long nextHandle = 0x8000L;
 
-		static readonly System.Collections.Generic.Dictionary<IntPtr, LanLobbyInfo> details =
-			new System.Collections.Generic.Dictionary<IntPtr, LanLobbyInfo>();   // value null => live current lobby
-		static readonly System.Collections.Generic.Dictionary<IntPtr, ModStage> mods =
-			new System.Collections.Generic.Dictionary<IntPtr, ModStage>();
-		static readonly System.Collections.Generic.Dictionary<IntPtr, string> searches =
-			new System.Collections.Generic.Dictionary<IntPtr, string>();
+		static readonly Dictionary<IntPtr, LanLobbyInfo> details = new Dictionary<IntPtr, LanLobbyInfo>();   // a null value is the live current lobby
+		static readonly Dictionary<IntPtr, ModStage> mods = new Dictionary<IntPtr, ModStage>();
+		static readonly Dictionary<IntPtr, string> searches = new Dictionary<IntPtr, string>();
 
 		static OnLobbyMemberStatusReceivedCallback memberStatusCb; static object memberStatusCd;
 		static OnLobbyUpdateReceivedCallback lobbyUpdateCb; static object lobbyUpdateCd;
 		static OnLobbyMemberUpdateReceivedCallback memberUpdateCb; static object memberUpdateCd;
 
-		// P2P connection lifecycle. The join flow depends on it: the host only marks a member
-		// NeedsSync (-> sends PrepareJoinGame) from OnRemoteConnectionEstablished.
-		static Epic.OnlineServices.P2P.OnIncomingConnectionRequestCallback connReqCb; static object connReqCd;
-		static Epic.OnlineServices.P2P.OnPeerConnectionEstablishedCallback connEstCb; static object connEstCd;
-		static readonly System.Collections.Generic.HashSet<string> connIn = new System.Collections.Generic.HashSet<string>();
-		static readonly System.Collections.Generic.HashSet<string> connOut = new System.Collections.Generic.HashSet<string>();
+		static OnIncomingConnectionRequestCallback connReqCb; static object connReqCd;
+		static OnPeerConnectionEstablishedCallback connEstCb; static object connEstCd;
+		static readonly HashSet<string> connIn = new HashSet<string>();
+		static readonly HashSet<string> connOut = new HashSet<string>();
 
-		public static void SetConnReqCb(Epic.OnlineServices.P2P.OnIncomingConnectionRequestCallback cb, object cd) { lock (gate) { connReqCb = cb; connReqCd = cd; } }
-		public static void SetConnEstCb(Epic.OnlineServices.P2P.OnPeerConnectionEstablishedCallback cb, object cd) { lock (gate) { connEstCb = cb; connEstCd = cd; } }
-
-		public static void ResetConnections() { lock (gate) { connIn.Clear(); connOut.Clear(); } }
-
-		// first packet we SEND to a peer: consider the outgoing connection established
-		public static void NotePacketSent(string toId, string socket)
-		{
-			bool fire; lock (gate) { fire = connOut.Add(toId); }
-			if (fire) FireEstablished(toId, socket);
-		}
-
-		// first packet we RECEIVE from a peer: incoming request, auto-accepted, established
-		public static void NotePacketReceived(string fromId, string socket)
-		{
-			bool fire; lock (gate) { fire = connIn.Add(fromId); }
-			if (fire) { FireConnRequest(fromId, socket); FireEstablished(fromId, socket); }
-		}
-
-		static void FireConnRequest(string id, string socket)
-		{
-			Epic.OnlineServices.P2P.OnIncomingConnectionRequestCallback cb; object cd;
-			lock (gate) { cb = connReqCb; cd = connReqCd; }
-			if (cb == null) return;
-			ProductUserId remote = new ProductUserId(MciLan.HandleForId(id));
-			ProductUserId local = new ProductUserId(MciLan.HandleForId(MciLan.LocalId));
-			Epic.OnlineServices.P2P.SocketId sock = new Epic.OnlineServices.P2P.SocketId { SocketName = socket };
-			MciLan.Post(delegate
-			{
-				Epic.OnlineServices.P2P.OnIncomingConnectionRequestInfo info = new Epic.OnlineServices.P2P.OnIncomingConnectionRequestInfo
-				{ ClientData = cd, LocalUserId = local, RemoteUserId = remote, SocketId = new Epic.OnlineServices.P2P.SocketId?(sock) };
-				cb(ref info);
-			});
-		}
-
-		static void FireEstablished(string id, string socket)
-		{
-			Epic.OnlineServices.P2P.OnPeerConnectionEstablishedCallback cb; object cd;
-			lock (gate) { cb = connEstCb; cd = connEstCd; }
-			if (cb == null) return;
-			ProductUserId remote = new ProductUserId(MciLan.HandleForId(id));
-			ProductUserId local = new ProductUserId(MciLan.HandleForId(MciLan.LocalId));
-			Epic.OnlineServices.P2P.SocketId sock = new Epic.OnlineServices.P2P.SocketId { SocketName = socket };
-			MciLan.Post(delegate
-			{
-				Epic.OnlineServices.P2P.OnPeerConnectionEstablishedInfo info = new Epic.OnlineServices.P2P.OnPeerConnectionEstablishedInfo
-				{
-					ClientData = cd, LocalUserId = local, RemoteUserId = remote,
-					SocketId = new Epic.OnlineServices.P2P.SocketId?(sock),
-					ConnectionType = Epic.OnlineServices.P2P.ConnectionEstablishedType.NewConnection,
-					NetworkType = Epic.OnlineServices.P2P.NetworkConnectionType.DirectConnection
-				};
-				cb(ref info);
-			});
-		}
-
+		// Null while UDP 55123 can't be bound; the next call retries
 		public static MciLanNet Net
 		{
 			get
@@ -470,12 +393,24 @@ namespace Paris.Engine.EOSLan
 				{
 					if (net == null)
 					{
-						net = new MciLanNet { LocalId = MciLan.LocalId, LocalName = MciLan.DisplayName };
-						net.MemberJoined += delegate (LanMember m) { FireMemberStatus(m.Id, LobbyMemberStatus.Joined); FireMemberUpdate(m.Id); };
-						net.MemberLeft += delegate (string id) { FireMemberStatus(id, LobbyMemberStatus.Left); };
-						net.LobbyChanged += FireLobbyUpdate;
-						net.MemberChanged += FireMemberUpdate;
-						net.Start();
+						MciLanNet n = new MciLanNet { LocalId = MciLan.LocalId, LocalName = MciLan.DisplayName };
+						// A returning member must count as a new connection, or the host never resends the join sync
+						n.MemberJoined += delegate (string id) { ResetConnection(id); FireMemberStatus(id, LobbyMemberStatus.Joined); FireMemberUpdate(id); };
+						n.MemberLeft += delegate (string id) { ResetConnection(id); FireMemberStatus(id, LobbyMemberStatus.Left); };
+						n.LobbyChanged += FireLobbyUpdate;
+						n.MemberChanged += FireMemberUpdate;
+						// The game only leaves on Kicked or Disconnected for the local user; it ignores Closed
+						n.LobbyLost += delegate (bool kicked) { ResetConnections(); FireMemberStatus(MciLan.LocalId, kicked ? LobbyMemberStatus.Kicked : LobbyMemberStatus.Disconnected); };
+						try
+						{
+							n.Start();
+						}
+						catch (Exception e)
+						{
+							Console.WriteLine("[EOSLAN] LAN net failed to start: " + e.Message);
+							return null;
+						}
+						net = n;
 						Console.WriteLine("[EOSLAN] LAN net started (" + MciLan.LocalId + ")");
 					}
 					return net;
@@ -501,16 +436,19 @@ namespace Paris.Engine.EOSLan
 		public static ModStage Mod(IntPtr h) { lock (gate) { ModStage s; return mods.TryGetValue(h, out s) ? s : null; } }
 		public static void CommitMod(IntPtr h)
 		{
+			MciLanNet n = Net;
 			ModStage s = Mod(h);
-			if (s == null) return;
-			foreach (System.Collections.Generic.KeyValuePair<string, LanAttr> kv in s.Attrs) Net.SetLobbyAttr(kv.Key, kv.Value);
-			if (s.Bucket != null) Net.SetBucket(s.Bucket);
-			if (s.Max.HasValue) Net.SetMaxMembers(s.Max.Value);
+			if (n == null || s == null) return;
+			// The game never releases a modification, so it's done with once committed
+			Release(h);
+			foreach (KeyValuePair<string, LanAttr> kv in s.Attrs) n.SetLobbyAttr(kv.Key, kv.Value);
+			if (s.Bucket != null) n.SetBucket(s.Bucket);
+			if (s.Max.HasValue) n.SetMaxMembers(s.Max.Value);
 			if (s.MemberAttrs.Count > 0)
 			{
-				Net.SetLocalMemberAttrs(s.MemberAttrs);
-				foreach (System.Collections.Generic.KeyValuePair<string, LanAttr> kv in s.MemberAttrs)
-					if (kv.Key == "NAME" && kv.Value.Type == 's') Net.SetLocalName(kv.Value.StringValue);
+				n.SetLocalMemberAttrs(s.MemberAttrs);
+				foreach (KeyValuePair<string, LanAttr> kv in s.MemberAttrs)
+					if (kv.Key == "NAME" && kv.Value.Type == 's') n.SetLocalName(kv.Value.StringValue);
 			}
 		}
 
@@ -518,13 +456,27 @@ namespace Paris.Engine.EOSLan
 		public static void SetSearchFilter(IntPtr h, string f) { lock (gate) searches[h] = f; }
 		public static string SearchFilter(IntPtr h) { lock (gate) { string f; searches.TryGetValue(h, out f); return f; } }
 
-		public static LanLobbyInfo CurrentSnapshot()   // caller may hold gate; only reads Net snapshots
+		// Handles are minted from one counter, so a handle is in at most one table
+		public static void Release(IntPtr h) { lock (gate) { details.Remove(h); mods.Remove(h); searches.Remove(h); } }
+
+		// Callers may hold gate, since this only reads Net snapshots
+		public static LanLobbyInfo CurrentSnapshot()
 		{
 			MciLanNet n = Net;
+			if (n == null) return null;
 			LanLobbyInfo info = new LanLobbyInfo { LobbyId = n.LobbyId, HostId = n.HostId, MaxMembers = n.MaxMembers, Bucket = n.Bucket };
 			foreach (LanMember m in n.Members()) info.Members.Add(m);
-			foreach (System.Collections.Generic.KeyValuePair<string, LanAttr> kv in n.Attributes()) info.Attributes[kv.Key] = kv.Value;
+			foreach (KeyValuePair<string, LanAttr> kv in n.Attributes()) info.Attributes[kv.Key] = kv.Value;
 			return info;
+		}
+
+		public static string LeaveLobby()
+		{
+			MciLanNet n = Net;
+			string id = (n != null) ? n.LobbyId : null;
+			if (n != null) n.Leave();
+			ResetConnections();
+			return id;
 		}
 
 		public static void SetMemberStatusCb(OnLobbyMemberStatusReceivedCallback cb, object cd) { lock (gate) { memberStatusCb = cb; memberStatusCd = cd; } }
@@ -545,7 +497,7 @@ namespace Paris.Engine.EOSLan
 			});
 		}
 
-		static void FireMemberStatus(string memberId, LobbyMemberStatus status)
+		public static void FireMemberStatus(string memberId, LobbyMemberStatus status)
 		{
 			OnLobbyMemberStatusReceivedCallback cb; object cd; string lid;
 			lock (gate) { cb = memberStatusCb; cd = memberStatusCd; lid = (net != null ? net.LobbyId : null); }
@@ -571,13 +523,69 @@ namespace Paris.Engine.EOSLan
 			});
 		}
 
+		public static void SetConnReqCb(OnIncomingConnectionRequestCallback cb, object cd) { lock (gate) { connReqCb = cb; connReqCd = cd; } }
+		public static void SetConnEstCb(OnPeerConnectionEstablishedCallback cb, object cd) { lock (gate) { connEstCb = cb; connEstCd = cd; } }
+
+		public static void ResetConnections() { lock (gate) { connIn.Clear(); connOut.Clear(); } }
+		public static void ResetConnection(string id) { lock (gate) { connIn.Remove(id); connOut.Remove(id); } }
+
+		// The first packet each way counts as an established P2P connection. The host only
+		// marks a member NeedsSync (and sends PrepareJoinGame) from OnRemoteConnectionEstablished
+		public static void NotePacketSent(string toId, string socket)
+		{
+			bool fire; lock (gate) { fire = connOut.Add(toId); }
+			if (fire) FireEstablished(toId, socket);
+		}
+
+		public static void NotePacketReceived(string fromId, string socket)
+		{
+			bool fire; lock (gate) { fire = connIn.Add(fromId); }
+			if (fire) { FireConnRequest(fromId, socket); FireEstablished(fromId, socket); }
+		}
+
+		static void FireConnRequest(string id, string socket)
+		{
+			OnIncomingConnectionRequestCallback cb; object cd;
+			lock (gate) { cb = connReqCb; cd = connReqCd; }
+			if (cb == null) return;
+			ProductUserId remote = new ProductUserId(MciLan.HandleForId(id));
+			ProductUserId local = new ProductUserId(MciLan.HandleForId(MciLan.LocalId));
+			SocketId sock = new SocketId { SocketName = socket };
+			MciLan.Post(delegate
+			{
+				OnIncomingConnectionRequestInfo info = new OnIncomingConnectionRequestInfo
+				{ ClientData = cd, LocalUserId = local, RemoteUserId = remote, SocketId = new SocketId?(sock) };
+				cb(ref info);
+			});
+		}
+
+		static void FireEstablished(string id, string socket)
+		{
+			OnPeerConnectionEstablishedCallback cb; object cd;
+			lock (gate) { cb = connEstCb; cd = connEstCd; }
+			if (cb == null) return;
+			ProductUserId remote = new ProductUserId(MciLan.HandleForId(id));
+			ProductUserId local = new ProductUserId(MciLan.HandleForId(MciLan.LocalId));
+			SocketId sock = new SocketId { SocketName = socket };
+			MciLan.Post(delegate
+			{
+				OnPeerConnectionEstablishedInfo info = new OnPeerConnectionEstablishedInfo
+				{
+					ClientData = cd, LocalUserId = local, RemoteUserId = remote,
+					SocketId = new SocketId?(sock),
+					ConnectionType = ConnectionEstablishedType.NewConnection,
+					NetworkType = NetworkConnectionType.DirectConnection
+				};
+				cb(ref info);
+			});
+		}
+
 		public static void PostDelayed(int ms, Action a)
 		{
 			System.Threading.Thread t = new System.Threading.Thread(delegate () { System.Threading.Thread.Sleep(ms); MciLan.Post(a); });
 			t.IsBackground = true; t.Start();
 		}
 
-		// Typed attribute conversion (EOS union <-> LanAttr)
 		public static Epic.OnlineServices.Lobby.Attribute? ToEosAttr(string key, LanAttr a)
 		{
 			if (a == null) return null;
@@ -616,16 +624,16 @@ namespace Epic.OnlineServices.Lobby
 		public void CreateLobby(ref CreateLobbyOptions options, object clientData, OnCreateLobbyCallback completionDelegate)
 		{
 			LobbyBridge.ResetConnections();
-			string id = MciLanBridge().CreateLobby(options.LobbyId, options.MaxLobbyMembers, options.BucketId);
-			Console.WriteLine("[EOSLAN] CreateLobby -> " + id + " (max " + options.MaxLobbyMembers + ")");
+			MciLanNet n = LobbyBridge.Net;
+			string id = (n != null) ? n.CreateLobby(options.LobbyId, options.MaxLobbyMembers, options.BucketId) : null;
+			Result result = (id != null) ? Result.Success : Result.UnexpectedError;
+			Console.WriteLine("[EOSLAN] CreateLobby -> " + (id ?? result.ToString()) + " (max " + options.MaxLobbyMembers + ")");
 			MciLan.Post(delegate
 			{
-				CreateLobbyCallbackInfo info = new CreateLobbyCallbackInfo { ResultCode = Result.Success, ClientData = clientData, LobbyId = id };
+				CreateLobbyCallbackInfo info = new CreateLobbyCallbackInfo { ResultCode = result, ClientData = clientData, LobbyId = id };
 				completionDelegate(ref info);
 			});
 		}
-
-		static MciLanNet MciLanBridge() { return LobbyBridge.Net; }
 
 		[MonoModReplace]
 		public Result CreateLobbySearch(ref CreateLobbySearchOptions options, out LobbySearch outLobbySearchHandle)
@@ -638,13 +646,14 @@ namespace Epic.OnlineServices.Lobby
 		public void JoinLobby(ref JoinLobbyOptions options, object clientData, OnJoinLobbyCallback completionDelegate)
 		{
 			LobbyBridge.ResetConnections();
+			MciLanNet n = LobbyBridge.Net;
 			LanLobbyInfo li = (options.LobbyDetailsHandle != null) ? LobbyBridge.DetailsInfo(options.LobbyDetailsHandle.InnerHandle) : null;
 			string id = (li != null) ? li.LobbyId : null;
-			bool ok = LobbyBridge.Net.Join(li);   // snapshot join: immune to search refreshes
-			Console.WriteLine("[EOSLAN] JoinLobby " + (id ?? "<null>") + " -> " + (ok ? "Success" : "NotFound"));
+			Result result = (n == null) ? Result.UnexpectedError : (n.Join(li) ? Result.Success : Result.NotFound);
+			Console.WriteLine("[EOSLAN] JoinLobby " + (id ?? "<null>") + " -> " + result);
 			MciLan.Post(delegate
 			{
-				JoinLobbyCallbackInfo info = new JoinLobbyCallbackInfo { ResultCode = ok ? Result.Success : Result.NotFound, ClientData = clientData, LobbyId = id };
+				JoinLobbyCallbackInfo info = new JoinLobbyCallbackInfo { ResultCode = result, ClientData = clientData, LobbyId = id };
 				completionDelegate(ref info);
 			});
 		}
@@ -652,9 +661,7 @@ namespace Epic.OnlineServices.Lobby
 		[MonoModReplace]
 		public void LeaveLobby(ref LeaveLobbyOptions options, object clientData, OnLeaveLobbyCallback completionDelegate)
 		{
-			string id = LobbyBridge.Net.LobbyId;
-			LobbyBridge.Net.Leave();
-			LobbyBridge.ResetConnections();
+			string id = LobbyBridge.LeaveLobby();
 			MciLan.Post(delegate
 			{
 				LeaveLobbyCallbackInfo info = new LeaveLobbyCallbackInfo { ResultCode = Result.Success, ClientData = clientData, LobbyId = id };
@@ -665,8 +672,7 @@ namespace Epic.OnlineServices.Lobby
 		[MonoModReplace]
 		public void DestroyLobby(ref DestroyLobbyOptions options, object clientData, OnDestroyLobbyCallback completionDelegate)
 		{
-			string id = LobbyBridge.Net.LobbyId;
-			LobbyBridge.Net.Leave();
+			string id = LobbyBridge.LeaveLobby();
 			MciLan.Post(delegate
 			{
 				DestroyLobbyCallbackInfo info = new DestroyLobbyCallbackInfo { ResultCode = Result.Success, ClientData = clientData, LobbyId = id };
@@ -692,10 +698,33 @@ namespace Epic.OnlineServices.Lobby
 		public void UpdateLobby(ref UpdateLobbyOptions options, object clientData, OnUpdateLobbyCallback completionDelegate)
 		{
 			if (options.LobbyModificationHandle != null) LobbyBridge.CommitMod(options.LobbyModificationHandle.InnerHandle);
-			string id = LobbyBridge.Net.LobbyId;
+			MciLanNet n = LobbyBridge.Net;
+			string id = (n != null) ? n.LobbyId : null;
 			MciLan.Post(delegate
 			{
 				UpdateLobbyCallbackInfo info = new UpdateLobbyCallbackInfo { ResultCode = Result.Success, ClientData = clientData, LobbyId = id };
+				completionDelegate(ref info);
+			});
+		}
+
+		// Host side. The kicked client hears KICK and leaves; everyone else sees it drop from the beacon
+		[MonoModReplace]
+		public void KickMember(ref KickMemberOptions options, object clientData, OnKickMemberCallback completionDelegate)
+		{
+			MciLanNet n = LobbyBridge.Net;
+			string target = (options.TargetUserId != null) ? MciLan.IdForHandle(options.TargetUserId.InnerHandle) : null;
+			string id = (n != null) ? n.LobbyId : null;
+			bool ok = n != null && target != null && n.Kick(target);
+			Result result = ok ? Result.Success : Result.NotFound;
+			Console.WriteLine("[EOSLAN] KickMember " + (target ?? "<null>") + " -> " + result);
+			if (ok)
+			{
+				LobbyBridge.ResetConnection(target);
+				LobbyBridge.FireMemberStatus(target, LobbyMemberStatus.Kicked);
+			}
+			MciLan.Post(delegate
+			{
+				KickMemberCallbackInfo info = new KickMemberCallbackInfo { ResultCode = result, ClientData = clientData, LobbyId = id };
 				completionDelegate(ref info);
 			});
 		}
@@ -720,12 +749,10 @@ namespace Epic.OnlineServices.Lobby
 			LobbyBridge.SetMemberUpdateCb(notificationFn, clientData);
 			return 3UL;
 		}
-		[MonoModReplace]
-		public ulong AddNotifyJoinLobbyAccepted(ref AddNotifyJoinLobbyAcceptedOptions options, object clientData, OnJoinLobbyAcceptedCallback notificationFn) { return 4UL; }
-		[MonoModReplace]
-		public ulong AddNotifyLobbyInviteAccepted(ref AddNotifyLobbyInviteAcceptedOptions options, object clientData, OnLobbyInviteAcceptedCallback notificationFn) { return 5UL; }
-		[MonoModReplace]
-		public ulong AddNotifyLobbyInviteReceived(ref AddNotifyLobbyInviteReceivedOptions options, object clientData, OnLobbyInviteReceivedCallback notificationFn) { return 6UL; }
+
+		[MonoModReplace] public ulong AddNotifyJoinLobbyAccepted(ref AddNotifyJoinLobbyAcceptedOptions options, object clientData, OnJoinLobbyAcceptedCallback notificationFn) { return 4UL; }
+		[MonoModReplace] public ulong AddNotifyLobbyInviteAccepted(ref AddNotifyLobbyInviteAcceptedOptions options, object clientData, OnLobbyInviteAcceptedCallback notificationFn) { return 5UL; }
+		[MonoModReplace] public ulong AddNotifyLobbyInviteReceived(ref AddNotifyLobbyInviteReceivedOptions options, object clientData, OnLobbyInviteReceivedCallback notificationFn) { return 6UL; }
 
 		[MonoModReplace] public void RemoveNotifyLobbyMemberStatusReceived(ulong inId) { }
 		[MonoModReplace] public void RemoveNotifyLobbyUpdateReceived(ulong inId) { }
@@ -745,7 +772,7 @@ namespace Epic.OnlineServices.Lobby
 			if (s != null && options.Attribute.HasValue)
 			{
 				AttributeData d = options.Attribute.Value;
-				s.Attrs.Add(new System.Collections.Generic.KeyValuePair<string, LanAttr>((string)d.Key, LobbyBridge.FromEos(d)));
+				s.Attrs.Add(new KeyValuePair<string, LanAttr>((string)d.Key, LobbyBridge.FromEos(d)));
 			}
 			return Result.Success;
 		}
@@ -757,7 +784,7 @@ namespace Epic.OnlineServices.Lobby
 			if (s != null && options.Attribute.HasValue)
 			{
 				AttributeData d = options.Attribute.Value;
-				s.MemberAttrs.Add(new System.Collections.Generic.KeyValuePair<string, LanAttr>((string)d.Key, LobbyBridge.FromEos(d)));
+				s.MemberAttrs.Add(new KeyValuePair<string, LanAttr>((string)d.Key, LobbyBridge.FromEos(d)));
 			}
 			return Result.Success;
 		}
@@ -783,12 +810,13 @@ namespace Epic.OnlineServices.Lobby
 		[MonoModReplace] public Result SetAllowedPlatformIds(ref LobbyModificationSetAllowedPlatformIdsOptions options) { return Result.Success; }
 		[MonoModReplace] public Result RemoveAttribute(ref LobbyModificationRemoveAttributeOptions options) { return Result.Success; }
 		[MonoModReplace] public Result RemoveMemberAttribute(ref LobbyModificationRemoveMemberAttributeOptions options) { return Result.Success; }
+		[MonoModReplace] public void Release() { LobbyBridge.Release(base.InnerHandle); }
 	}
 
 	[MonoModPatch("Epic.OnlineServices.Lobby.LobbyDetails")]
 	class patch_LobbyDetails : Handle
 	{
-		LanMember FindMember(LanLobbyInfo li, ProductUserId puid)
+		private static LanMember MCI_FindMember(LanLobbyInfo li, ProductUserId puid)
 		{
 			string id = (puid != null) ? MciLan.IdForHandle(puid.InnerHandle) : null;
 			if (li == null || id == null) return null;
@@ -861,7 +889,7 @@ namespace Epic.OnlineServices.Lobby
 			outAttribute = null;
 			if (li == null) return Result.NotFound;
 			int i = 0;
-			foreach (System.Collections.Generic.KeyValuePair<string, LanAttr> kv in li.Attributes)
+			foreach (KeyValuePair<string, LanAttr> kv in li.Attributes)
 			{
 				if (i++ == options.AttrIndex) { outAttribute = LobbyBridge.ToEosAttr(kv.Key, kv.Value); return Result.Success; }
 			}
@@ -872,7 +900,7 @@ namespace Epic.OnlineServices.Lobby
 		public Result CopyMemberInfo(ref LobbyDetailsCopyMemberInfoOptions options, out LobbyDetailsMemberInfo? outLobbyDetailsMemberInfo)
 		{
 			LanLobbyInfo li = LobbyBridge.DetailsInfo(base.InnerHandle);
-			LanMember m = FindMember(li, options.TargetUserId);
+			LanMember m = MCI_FindMember(li, options.TargetUserId);
 			outLobbyDetailsMemberInfo = new LobbyDetailsMemberInfo
 			{
 				UserId = options.TargetUserId,
@@ -886,7 +914,7 @@ namespace Epic.OnlineServices.Lobby
 		public uint GetMemberAttributeCount(ref LobbyDetailsGetMemberAttributeCountOptions options)
 		{
 			LanLobbyInfo li = LobbyBridge.DetailsInfo(base.InnerHandle);
-			LanMember m = FindMember(li, options.TargetUserId);
+			LanMember m = MCI_FindMember(li, options.TargetUserId);
 			return (m != null) ? (uint)m.Attributes.Count : 0U;
 		}
 
@@ -894,13 +922,13 @@ namespace Epic.OnlineServices.Lobby
 		public Result CopyMemberAttributeByKey(ref LobbyDetailsCopyMemberAttributeByKeyOptions options, out Attribute? outAttribute)
 		{
 			LanLobbyInfo li = LobbyBridge.DetailsInfo(base.InnerHandle);
-			LanMember m = FindMember(li, options.TargetUserId);
+			LanMember m = MCI_FindMember(li, options.TargetUserId);
 			string key = (string)options.AttrKey;
 			outAttribute = null;
 			if (m == null) return Result.NotFound;
 			LanAttr a;
 			if (m.Attributes.TryGetValue(key, out a)) { outAttribute = LobbyBridge.ToEosAttr(key, a); return Result.Success; }
-			// built-in fallbacks (always known even before the first member-attr commit)
+			// NAME and PLATFORM are known before the first member attribute commit
 			if (key == "NAME") { outAttribute = LobbyBridge.ToEosAttr("NAME", LanAttr.Str(m.Name)); return Result.Success; }
 			if (key == "PLATFORM") { outAttribute = LobbyBridge.ToEosAttr("PLATFORM", LanAttr.Int(m.Platform)); return Result.Success; }
 			return Result.NotFound;
@@ -910,18 +938,18 @@ namespace Epic.OnlineServices.Lobby
 		public Result CopyMemberAttributeByIndex(ref LobbyDetailsCopyMemberAttributeByIndexOptions options, out Attribute? outAttribute)
 		{
 			LanLobbyInfo li = LobbyBridge.DetailsInfo(base.InnerHandle);
-			LanMember m = FindMember(li, options.TargetUserId);
+			LanMember m = MCI_FindMember(li, options.TargetUserId);
 			outAttribute = null;
 			if (m == null) return Result.NotFound;
 			int i = 0;
-			foreach (System.Collections.Generic.KeyValuePair<string, LanAttr> kv in m.Attributes)
+			foreach (KeyValuePair<string, LanAttr> kv in m.Attributes)
 			{
 				if (i++ == options.AttrIndex) { outAttribute = LobbyBridge.ToEosAttr(kv.Key, kv.Value); return Result.Success; }
 			}
 			return Result.NotFound;
 		}
 
-		[MonoModReplace] public void Release() { }
+		[MonoModReplace] public void Release() { LobbyBridge.Release(base.InnerHandle); }
 	}
 
 	[MonoModPatch("Epic.OnlineServices.Lobby.LobbySearch")]
@@ -943,10 +971,20 @@ namespace Epic.OnlineServices.Lobby
 		public void Find(ref LobbySearchFindOptions options, object clientData, LobbySearchOnFindCallback completionDelegate)
 		{
 			string filter = LobbyBridge.SearchFilter(base.InnerHandle);
-			LobbyBridge.Net.StartSearch(filter);
+			MciLanNet n = LobbyBridge.Net;
+			if (n == null)
+			{
+				MciLan.Post(delegate
+				{
+					LobbySearchFindCallbackInfo failed = new LobbySearchFindCallbackInfo { ResultCode = Result.UnexpectedError, ClientData = clientData };
+					completionDelegate(ref failed);
+				});
+				return;
+			}
+			n.StartSearch(filter);
 			LobbyBridge.PostDelayed(1600, delegate
 			{
-				Console.WriteLine("[EOSLAN] Find" + (filter != null ? "(" + filter + ")" : "") + " -> " + LobbyBridge.Net.SearchResults().Count + " lobby(ies)");
+				Console.WriteLine("[EOSLAN] Find" + (filter != null ? "(" + filter + ")" : "") + " -> " + n.SearchResults().Count + " lobby(ies)");
 				LobbySearchFindCallbackInfo info = new LobbySearchFindCallbackInfo { ResultCode = Result.Success, ClientData = clientData };
 				completionDelegate(ref info);
 			});
@@ -955,19 +993,21 @@ namespace Epic.OnlineServices.Lobby
 		[MonoModReplace]
 		public uint GetSearchResultCount(ref LobbySearchGetSearchResultCountOptions options)
 		{
-			return (uint)LobbyBridge.Net.SearchResults().Count;
+			MciLanNet n = LobbyBridge.Net;
+			return (n != null) ? (uint)n.SearchResults().Count : 0U;
 		}
 
 		[MonoModReplace]
 		public Result CopySearchResultByIndex(ref LobbySearchCopySearchResultByIndexOptions options, out LobbyDetails outLobbyDetailsHandle)
 		{
-			System.Collections.Generic.List<LanLobbyInfo> results = LobbyBridge.Net.SearchResults();
+			MciLanNet n = LobbyBridge.Net;
+			List<LanLobbyInfo> results = (n != null) ? n.SearchResults() : new List<LanLobbyInfo>();
 			if (options.LobbyIndex >= results.Count) { outLobbyDetailsHandle = null; return Result.NotFound; }
 			outLobbyDetailsHandle = new LobbyDetails(LobbyBridge.NewDetailsFrozen(results[(int)options.LobbyIndex]));
 			return Result.Success;
 		}
 
-		[MonoModReplace] public void Release() { }
+		[MonoModReplace] public void Release() { LobbyBridge.Release(base.InnerHandle); }
 	}
 }
 
@@ -979,9 +1019,10 @@ namespace Epic.OnlineServices.Presence
 		[MonoModReplace]
 		public Result CreatePresenceModification(ref CreatePresenceModificationOptions options, out PresenceModification outPresenceModificationHandle)
 		{
-			outPresenceModificationHandle = new PresenceModification(Paris.Engine.EOSLan.MciLan.FakeHandle);
+			outPresenceModificationHandle = new PresenceModification(MciLan.FakeHandle);
 			return Result.Success;
 		}
+
 		[MonoModReplace] public void SetPresence(ref SetPresenceOptions options, object clientData, SetPresenceCompleteCallback completionDelegate) { }
 		[MonoModReplace] public ulong AddNotifyOnPresenceChanged(ref AddNotifyOnPresenceChangedOptions options, object clientData, OnPresenceChangedCallback notificationHandler) { return 1UL; }
 		[MonoModReplace] public ulong AddNotifyJoinGameAccepted(ref AddNotifyJoinGameAcceptedOptions options, object clientData, OnJoinGameAcceptedCallback notificationFn) { return 2UL; }
@@ -1005,15 +1046,16 @@ namespace Epic.OnlineServices.Presence
 
 namespace Epic.OnlineServices.P2P
 {
+	// Real transport over the LAN core, unicast UDP to each member's address
 	[MonoModPatch("Epic.OnlineServices.P2P.P2PInterface")]
 	class patch_P2PInterface : Handle
 	{
-		// Real transport over the LAN core: unicast UDP to the member's address.
 		[MonoModReplace]
 		public Result ReceivePacket(ref ReceivePacketOptions options, ref ProductUserId outPeerId, ref SocketId outSocketId, out byte outChannel, ArraySegment<byte> outData, out uint outBytesWritten)
 		{
 			outChannel = 0; outBytesWritten = 0;
-			LanPacket p = LobbyBridge.Net.DequeuePacket();
+			MciLanNet lan = LobbyBridge.Net;
+			LanPacket p = (lan != null) ? lan.DequeuePacket() : null;
 			if (p == null) return Result.NotFound;
 			LobbyBridge.NotePacketReceived(p.FromId, p.Socket);
 			outPeerId = new ProductUserId(MciLan.HandleForId(p.FromId));
@@ -1032,7 +1074,8 @@ namespace Epic.OnlineServices.P2P
 		[MonoModReplace]
 		public Result GetNextReceivedPacketSize(ref GetNextReceivedPacketSizeOptions options, out uint outPacketSizeBytes)
 		{
-			LanPacket p = LobbyBridge.Net.PeekPacket();
+			MciLanNet n = LobbyBridge.Net;
+			LanPacket p = (n != null) ? n.PeekPacket() : null;
 			outPacketSizeBytes = (p != null) ? (uint)p.Data.Length : 0U;
 			return (p != null) ? Result.Success : Result.NotFound;
 		}
@@ -1045,29 +1088,35 @@ namespace Epic.OnlineServices.P2P
 			byte[] data = new byte[options.Data.Count];
 			if (options.Data.Array != null) Array.Copy(options.Data.Array, options.Data.Offset, data, 0, options.Data.Count);
 			bool reliable = options.Reliability != PacketReliability.UnreliableUnordered;
-			bool ok = reliable
-				? LobbyBridge.Net.SendPacketReliable(to, options.Channel, sock, data)
-				: LobbyBridge.Net.SendPacket(to, options.Channel, sock, data);
+			MciLanNet n = LobbyBridge.Net;
+			bool ok = n != null && (reliable
+				? n.SendPacketReliable(to, options.Channel, sock, data)
+				: n.SendPacket(to, options.Channel, sock, data));
 			if (!ok) return Result.NotFound;
 			LobbyBridge.NotePacketSent(to, sock);
 			return Result.Success;
 		}
+
 		[MonoModReplace] public Result AcceptConnection(ref AcceptConnectionOptions options) { return Result.Success; }
 		[MonoModReplace] public Result CloseConnection(ref CloseConnectionOptions options) { return Result.Success; }
 		[MonoModReplace] public Result CloseConnections(ref CloseConnectionsOptions options) { return Result.Success; }
+
 		[MonoModReplace]
 		public ulong AddNotifyPeerConnectionRequest(ref AddNotifyPeerConnectionRequestOptions options, object clientData, OnIncomingConnectionRequestCallback connectionRequestHandler)
 		{
 			LobbyBridge.SetConnReqCb(connectionRequestHandler, clientData);
 			return 1UL;
 		}
+
 		[MonoModReplace] public ulong AddNotifyPeerConnectionClosed(ref AddNotifyPeerConnectionClosedOptions options, object clientData, OnRemoteConnectionClosedCallback connectionClosedHandler) { return 2UL; }
+
 		[MonoModReplace]
 		public ulong AddNotifyPeerConnectionEstablished(ref AddNotifyPeerConnectionEstablishedOptions options, object clientData, OnPeerConnectionEstablishedCallback connectionEstablishedHandler)
 		{
 			LobbyBridge.SetConnEstCb(connectionEstablishedHandler, clientData);
 			return 3UL;
 		}
+
 		[MonoModReplace] public ulong AddNotifyPeerConnectionInterrupted(ref AddNotifyPeerConnectionInterruptedOptions options, object clientData, OnPeerConnectionInterruptedCallback connectionInterruptedHandler) { return 4UL; }
 		[MonoModReplace] public void RemoveNotifyPeerConnectionRequest(ulong notificationId) { }
 		[MonoModReplace] public void RemoveNotifyPeerConnectionClosed(ulong notificationId) { }
@@ -1078,7 +1127,7 @@ namespace Epic.OnlineServices.P2P
 
 namespace Epic.OnlineServices.Sanctions
 {
-	// HostGame gates lobby creation behind a sanctions check. No sanctions on a LAN.
+	// HostGame gates lobby creation behind a sanctions check. No sanctions on a LAN
 	[MonoModPatch("Epic.OnlineServices.Sanctions.SanctionsInterface")]
 	class patch_SanctionsInterface : Handle
 	{
@@ -1112,7 +1161,7 @@ namespace Epic.OnlineServices.Sanctions
 
 namespace Epic.OnlineServices.Friends
 {
-	// No friends list on LAN; empty results keep the friends UI harmless.
+	// No friends list on LAN, so report an empty one
 	[MonoModPatch("Epic.OnlineServices.Friends.FriendsInterface")]
 	class patch_FriendsInterface : Handle
 	{
@@ -1138,12 +1187,11 @@ namespace Epic.OnlineServices.Friends
 
 namespace Paris.Engine.Networking
 {
-	// Stock GetLocalName needs Steam or a resolved Epic account - neither exists on LAN,
-	// so it returns "" and every player shows up nameless. Use the device name instead.
+	// Use the device name, since stock needs Steam or a resolved Epic account
 	class patch_NetworkManager : NetworkManager
 	{
 		[MonoModReplace]
-		private string GetLocalName()
+		private new string GetLocalName()
 		{
 			return MciLan.DisplayName;
 		}
@@ -1152,7 +1200,7 @@ namespace Paris.Engine.Networking
 
 namespace Paris.Engine
 {
-	// Not Steam/Epic sessions - suppress the platform icons (items hide unknown names).
+	// No Steam or Epic icons on LAN sessions; the menu hides an icon name it doesn't know
 	[MonoModPatch("Paris.Engine.PlatformsExtraInfo")]
 	static class patch_PlatformsExtraInfo
 	{
@@ -1166,10 +1214,10 @@ namespace Paris.Engine
 
 namespace Paris.Engine.Localisation
 {
-	// Swap display strings at the localization choke point (covers both lookup paths).
+	// Show "LAN" in place of "Online" in both string lookups
 	class patch_LocManager : LocManager
 	{
-		private static string MciLanText(string s)
+		private static string MCI_LanText(string s)
 		{
 			switch (s)
 			{
@@ -1182,13 +1230,13 @@ namespace Paris.Engine.Localisation
 		public extern string orig_GetString(int stringIndex);
 		public new string GetString(int stringIndex)
 		{
-			return MciLanText(orig_GetString(stringIndex));
+			return MCI_LanText(orig_GetString(stringIndex));
 		}
 
 		public extern string orig_GetString(string locID);
 		public new string GetString(string locID)
 		{
-			return MciLanText(orig_GetString(locID));
+			return MCI_LanText(orig_GetString(locID));
 		}
 	}
 }

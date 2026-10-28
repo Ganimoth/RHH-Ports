@@ -1,9 +1,9 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
-using System.Text;
-using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Text;
 
 // Re-encodes MCI's RGBA textures in place for low-memory devices
 // R8 for palette-indexed art and small fonts, ASTC for everything else

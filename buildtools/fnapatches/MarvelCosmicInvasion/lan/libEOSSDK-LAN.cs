@@ -1,35 +1,40 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Jeod
 //
-// libEOSSDK-LAN - LAN lobby + transport core behind the EOS shim.
-// Kept free of Epic types so it can become a native lib shared by other EOS ports.
+// LAN lobby and transport core behind the EOS shim
+// Kept free of Epic types so it can become a native lib shared by other EOS ports
 //
 // One UDP socket does everything:
 //   host    broadcasts a lobby snapshot beacon every 1s (id, members, attributes)
 //   client  unicasts a JOIN heartbeat to the host every 1s (name, platform, member attrs)
 //   both    exchange game packets (PKT unreliable, RPK/ACK reliable-ordered)
+// A peer is dropped after 5s of silence, or once a reliable packet to it goes unacked for 10s
 //
-// Wire messages are "MCILAN1:" + ':'-delimited fields, base64 where content is free-form:
+// Wire messages are "MCILAN2:" + ':'-delimited fields, base64 where content is free-form:
 //   LOBBY:<lobbyId>:<hostId>:<snapshotB64>
-//   JOIN:<lobbyId>:<clientId>:<nameB64>:<plat>:<attrsB64>
-//   LEAVE:<lobbyId>:<clientId>
-//   PKT:<fromId>:<channel>:<socketB64>:<payloadB64>
-//   RPK:<fromId>:<channel>:<socketB64>:<seq>:<payloadB64>
-//   ACK:<ackerId>:<seq>
-// Snapshot records: H|max|bucket  M|id|name|plat|addr|attrs  A|key|type|value
+//   JOIN:<lobbyId>:<clientId>:<session>:<nameB64>:<plat>:<attrsB64>
+//   LEAVE:<lobbyId>:<clientId>:<session>
+//   KICK:<lobbyId>:<clientId>:<session>
+//   CLOSE:<lobbyId>:<hostId>
+//   PKT:<fromId>:<channel>:<socketB64>:<payload>
+//   RPK:<fromId>:<channel>:<socketB64>:<epoch>:<seq>:<payload>
+//   ACK:<ackerId>:<epoch>:<seq>
+// PKT and RPK payloads are raw bytes after the last field, so a full game packet fits one datagram
+// Sessions number each join and epochs each reliable stream, so a rejoin starts both sides afresh
+// Snapshot records: H|max|bucketB64  M|id|session|nameB64|plat|addr|attrsB64  A|key|type|valueB64
+// Attribute blobs: newline-separated key|type|valueB64 records, base64'd as a whole
 using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Net;
-using System.Net.Sockets;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 
 namespace Paris.Engine.EOSLan
 {
-	// A typed lobby/attribute value mirroring EOS's int64/bool/double/string union.
-	// Only the field matching Type is meaningful.
+	// An EOS attribute value. Only the field matching Type is meaningful
 	class LanAttr
 	{
 		public char Type;   // 'i' int64, 'b' bool, 'd' double, 's' string
@@ -43,7 +48,6 @@ namespace Paris.Engine.EOSLan
 		public static LanAttr Dbl(double value) { return new LanAttr { Type = 'd', DoubleValue = value }; }
 		public static LanAttr Str(string value) { return new LanAttr { Type = 's', StringValue = value ?? "" }; }
 
-		// Culture-invariant textual form for the wire.
 		public string ToWireString()
 		{
 			switch (Type)
@@ -85,13 +89,19 @@ namespace Paris.Engine.EOSLan
 		public string Id;
 		public string Name = "";
 		public int Platform;
-		public IPEndPoint Endpoint;    // where this member lives (host learns from JOINs; clients from the snapshot)
-		public long LastSeenMs;        // host-side: for timeout eviction
-		// Member attributes (GUESTS/CHANNEL/NAME/PLATFORM). GUESTS gates the game's member sync.
-		public readonly Dictionary<string, LanAttr> Attributes = new Dictionary<string, LanAttr>();
+		public int Session;
+		public IPEndPoint Endpoint;    // the host learns it from JOINs, clients from the snapshot
+		public long LastSeenMs;        // host only, for timeout eviction
+		public readonly Dictionary<string, LanAttr> Attributes = new Dictionary<string, LanAttr>();   // GUESTS gates the game's member sync
+
+		public LanMember Clone()
+		{
+			var copy = new LanMember { Id = Id, Name = Name, Platform = Platform, Session = Session, Endpoint = Endpoint, LastSeenMs = LastSeenMs };
+			foreach (var attr in Attributes) copy.Attributes[attr.Key] = attr.Value;
+			return copy;
+		}
 	}
 
-	// A received P2P payload, consumed by the EOS P2PInterface shim.
 	class LanPacket
 	{
 		public string FromId;
@@ -100,102 +110,129 @@ namespace Paris.Engine.EOSLan
 		public byte[] Data;
 	}
 
-	// Reliable-ordered state per peer: resend until acked, deliver in order exactly once.
+	// Per peer: resend until acked, deliver in order exactly once
 	class ReliableStream
 	{
+		public int Epoch;
 		public int NextOutgoingSeq = 1;
 		public readonly Dictionary<int, PendingSend> Unacked = new Dictionary<int, PendingSend>();
+		public int PeerEpoch;
 		public int NextExpectedSeq = 1;
 		public readonly Dictionary<int, LanPacket> OutOfOrder = new Dictionary<int, LanPacket>();
 	}
 
 	class PendingSend
 	{
-		public string ToId;
-		public string Message;
-		public long LastSentMs;
+		public byte[] Datagram;
+		public long FirstSentMs, LastSentMs;
 	}
 
-	// A discovered lobby (search result / joined snapshot).
 	class LanLobbyInfo
 	{
 		public string LobbyId;
 		public string HostId;
 		public uint MaxMembers = 4;
 		public string Bucket = "";
-		public readonly List<LanMember> Members = new List<LanMember>();   // ordered
+		public readonly List<LanMember> Members = new List<LanMember>();   // host first
 		public readonly Dictionary<string, LanAttr> Attributes = new Dictionary<string, LanAttr>();
+	}
+
+	// Lobby changes gathered under the state lock, raised once it is released
+	class LanChanges
+	{
+		public readonly List<string> Left = new List<string>();
+		public readonly List<string> Joined = new List<string>();
+		public readonly List<string> Changed = new List<string>();
+		public bool LobbyChanged, Lost, Kicked;
 	}
 
 	class MciLanNet
 	{
 		public const int PORT = 55123;
-		const string Prefix = "MCILAN1:";
+		const string Prefix = "MCILAN2:";
 		const int TxTickMs = 200;          // resend granularity
-		const int HeartbeatMs = 1000;      // beacon / JOIN heartbeat cadence
+		const int HeartbeatMs = 1000;      // beacon and JOIN heartbeat cadence
 		const int MemberTimeoutMs = 5000;
 		const int ResendMs = 250;
+		const int ReliableGiveUpMs = 10000;
 		const int OutOfOrderBufferCap = 256;
-		const int InboxFloodCap = 512;
+		const int InboxFloodCap = 512;     // unreliable packets stop here, so reliable ones keep headroom
+		const int ReliableInboxCap = 2048;
+
+		static readonly byte[] PrefixBytes = Encoding.ASCII.GetBytes(Prefix);
 
 		readonly object stateLock = new object();
 		UdpClient socket;
 		List<IPEndPoint> broadcastTargets;
 		long clockBaseTicks;    // Environment.TickCount can wrap; we only need deltas
 
-		// local identity
 		public string LocalId, LocalName = "Player";
-		public int LocalPlatform = 258;
+		public int LocalPlatform = 258;   // Platforms.Steam | Platforms.Windows
+		readonly Dictionary<string, LanAttr> localMemberAttributes = new Dictionary<string, LanAttr>();
+		int localSession, lastSession;
 
-		// current lobby (host or joined-as-client)
 		public bool IsHost, InLobby;
 		public string LobbyId, HostId;
 		public uint MaxMembers = 4;
 		public string Bucket = "";
-		readonly List<LanMember> members = new List<LanMember>();          // ordered, host is authoritative
+		readonly List<LanMember> members = new List<LanMember>();   // host first
 		readonly Dictionary<string, LanAttr> lobbyAttributes = new Dictionary<string, LanAttr>();
 
-		// client-side: host endpoint we heartbeat to, and whether we've been acknowledged
+		// Host side: "id/session" of each removed member, true if kicked, so its heartbeats can't re-add it
+		readonly Dictionary<string, bool> droppedSessions = new Dictionary<string, bool>();
+
+		// Client side
 		IPEndPoint hostEndpoint;
+		long hostLastSeenMs;
 		public bool JoinAcknowledged;
 
-		// last-known endpoint per peer, learned from any datagram - replies must not
-		// have to wait for membership to propagate
+		// Learned from any datagram, so replies needn't wait for membership to propagate
 		readonly Dictionary<string, IPEndPoint> peerEndpoints = new Dictionary<string, IPEndPoint>();
 
-		// search
 		bool searching;
 		string searchFilterId;    // non-null => join-by-code
 		readonly Dictionary<string, LanLobbyInfo> searchResults = new Dictionary<string, LanLobbyInfo>();
 
-		// raised on the Rx thread; the adapter re-posts onto Platform.Tick
-		public event Action<LanMember> MemberJoined;
+		// Raised on the network threads, or the caller's for Kick; the adapter re-posts them onto Platform.Tick
+		public event Action<string> MemberJoined;
 		public event Action<string> MemberLeft;
 		public event Action LobbyChanged;
 		public event Action<string> MemberChanged;   // a member's attributes changed
+		public event Action<bool> LobbyLost;         // the lobby dropped us, true if kicked
 
-		// our member attributes, carried by JOIN heartbeats and beacons
-		readonly Dictionary<string, LanAttr> localMemberAttributes = new Dictionary<string, LanAttr>();
-
-		// inbound game packets waiting for the shim, and reliable-delivery state per peer
 		readonly Queue<LanPacket> inbox = new Queue<LanPacket>();
 		readonly Dictionary<string, ReliableStream> reliableStreams = new Dictionary<string, ReliableStream>();
+		int lastEpoch;
 
 		long NowMs() { return (Environment.TickCount - clockBaseTicks) & 0x7fffffffL; }
+
+		// Hostnames repeat across devices (every ROCKNIX unit is "ROCKNIX"), hence the per-process suffix
+		public static string NewLocalId(string name)
+		{
+			return "LAN-" + name + "-" + Guid.NewGuid().ToString("N").Substring(0, 8);
+		}
 
 		public void Start()
 		{
 			clockBaseTicks = Environment.TickCount;
-			socket = new UdpClient();
-			socket.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-			socket.EnableBroadcast = true;
-			socket.Client.Bind(new IPEndPoint(IPAddress.Any, PORT));
+			var udp = new UdpClient();
+			try
+			{
+				udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+				udp.EnableBroadcast = true;
+				udp.Client.Bind(new IPEndPoint(IPAddress.Any, PORT));
+			}
+			catch
+			{
+				udp.Close();
+				throw;
+			}
+			socket = udp;
 			broadcastTargets = FindBroadcastTargets(PORT);
 			new Thread(ReceiveLoop) { IsBackground = true, Name = "MciLanRx" }.Start();
 			new Thread(SendLoop) { IsBackground = true, Name = "MciLanTx" }.Start();
 		}
 
-		// Host-side lobby management
 		public string CreateLobby(string lobbyId, uint maxMembers, string bucket)
 		{
 			lock (stateLock)
@@ -205,12 +242,27 @@ namespace Paris.Engine.EOSLan
 				HostId = LocalId;
 				MaxMembers = maxMembers > 0 ? maxMembers : 4;
 				Bucket = bucket ?? "";
-				members.Clear(); lobbyAttributes.Clear(); peerEndpoints.Clear(); reliableStreams.Clear(); inbox.Clear();
-				LanMember self = new LanMember { Id = LocalId, Name = LocalName, Platform = LocalPlatform };
+				ClearLobbyState();
+				localSession = ++lastSession;
+				LanMember self = new LanMember { Id = LocalId, Name = LocalName, Platform = LocalPlatform, Session = localSession };
 				foreach (var attr in localMemberAttributes) self.Attributes[attr.Key] = attr.Value;
 				members.Add(self);
 			}
 			return LobbyId;
+		}
+
+		string GenerateLobbyCode()
+		{
+			// Short and typeable, for "Join Party Code"
+			const string Alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+			var builder = new StringBuilder();
+			int seed = Environment.TickCount ^ (LocalId != null ? LocalId.GetHashCode() : 0);
+			for (int i = 0; i < 6; i++)
+			{
+				seed = seed * 1103515245 + 12345;
+				builder.Append(Alphabet[((seed >> 16) & 0x7fff) % Alphabet.Length]);
+			}
+			return builder.ToString();
 		}
 
 		public void SetLobbyAttr(string key, LanAttr value) { lock (stateLock) lobbyAttributes[key] = value; }
@@ -224,7 +276,7 @@ namespace Paris.Engine.EOSLan
 			{
 				LocalName = name;
 				LanMember self = members.Find(candidate => candidate.Id == LocalId);
-				if (self != null) self.Name = name;   // host: beacon snapshot picks it up
+				if (self != null) self.Name = name;
 			}
 		}
 
@@ -240,18 +292,19 @@ namespace Paris.Engine.EOSLan
 			}
 		}
 
-		public LanAttr GetMemberAttr(string memberId, string key)
+		// Copies, since the receive thread rewrites member attributes in place
+		public List<LanMember> Members()
 		{
 			lock (stateLock)
 			{
-				LanMember member = members.Find(candidate => candidate.Id == memberId);
-				if (member == null) return null;
-				LanAttr value;
-				return member.Attributes.TryGetValue(key, out value) ? value : null;
+				var copies = new List<LanMember>(members.Count);
+				foreach (var member in members) copies.Add(member.Clone());
+				return copies;
 			}
 		}
 
-		// Client-side search and join
+		public Dictionary<string, LanAttr> Attributes() { lock (stateLock) { return new Dictionary<string, LanAttr>(lobbyAttributes); } }
+
 		public void StartSearch(string filterLobbyId)
 		{
 			lock (stateLock) { searching = true; searchFilterId = filterLobbyId; searchResults.Clear(); }
@@ -262,14 +315,7 @@ namespace Paris.Engine.EOSLan
 			lock (stateLock) { return new List<LanLobbyInfo>(searchResults.Values); }
 		}
 
-		public bool Join(string lobbyId)
-		{
-			LanLobbyInfo info;
-			lock (stateLock) { if (!searchResults.TryGetValue(lobbyId, out info)) return false; }
-			return Join(info);
-		}
-
-		// Join from a snapshot (frozen search result) so a search refresh can't invalidate it.
+		// Takes a frozen search result, so a search refresh can't invalidate it
 		public bool Join(LanLobbyInfo info)
 		{
 			if (info == null || string.IsNullOrEmpty(info.LobbyId)) return false;
@@ -281,47 +327,120 @@ namespace Paris.Engine.EOSLan
 				LobbyId = info.LobbyId; HostId = info.HostId;
 				MaxMembers = info.MaxMembers; Bucket = info.Bucket;
 				hostEndpoint = info.Members.Count > 0 ? info.Members[0].Endpoint : null;
-				// seed member/attr view from the snapshot; refreshed by beacons
-				members.Clear(); lobbyAttributes.Clear(); peerEndpoints.Clear(); reliableStreams.Clear(); inbox.Clear();
+				hostLastSeenMs = NowMs();
+				ClearLobbyState();
+				localSession = ++lastSession;
 				foreach (var source in info.Members)
 				{
-					var copy = new LanMember { Id = source.Id, Name = source.Name, Platform = source.Platform, Endpoint = source.Endpoint };
-					foreach (var attr in source.Attributes) copy.Attributes[attr.Key] = attr.Value;
-					members.Add(copy);
-					if (copy.Endpoint != null) peerEndpoints[copy.Id] = copy.Endpoint;
+					members.Add(source.Clone());
+					if (source.Endpoint != null) peerEndpoints[source.Id] = source.Endpoint;
 				}
 				foreach (var attr in info.Attributes) lobbyAttributes[attr.Key] = attr.Value;
 				searching = false;
 				host = hostEndpoint;
-				joinMessage = Prefix + "JOIN:" + LobbyId + ":" + LocalId + ":" + ToBase64(LocalName) + ":" + LocalPlatform + ":" + SerializeAttributes(localMemberAttributes);
+				joinMessage = JoinMessage();
 			}
-			// announce now - the game sends packets right after joining
-			if (host != null) Send(joinMessage, new List<IPEndPoint> { host });
+			// Announce now, since the game sends packets right after joining
+			if (host != null) Send(joinMessage, host);
 			return true;
 		}
 
 		public void Leave()
 		{
-			IPEndPoint host; string lobbyId, myId;
+			string message;
+			var destinations = new List<IPEndPoint>();
 			lock (stateLock)
 			{
 				if (!InLobby) return;
-				host = hostEndpoint; lobbyId = LobbyId; myId = LocalId;
-				InLobby = false; IsHost = false; JoinAcknowledged = false;
-				members.Clear(); lobbyAttributes.Clear(); peerEndpoints.Clear(); reliableStreams.Clear(); inbox.Clear();
-				LobbyId = null; HostId = null; hostEndpoint = null;
+				if (IsHost)
+				{
+					// Broadcast as well, so searchers drop the lobby too
+					message = Prefix + "CLOSE:" + LobbyId + ":" + LocalId;
+					destinations.AddRange(broadcastTargets);
+					foreach (var member in members)
+						if (member.Id != LocalId && member.Endpoint != null) destinations.Add(member.Endpoint);
+				}
+				else
+				{
+					message = Prefix + "LEAVE:" + LobbyId + ":" + LocalId + ":" + localSession;
+					if (hostEndpoint != null) destinations.Add(hostEndpoint);
+				}
+				ClearLobby();
 			}
-			if (host != null) Send(Prefix + "LEAVE:" + lobbyId + ":" + myId, new List<IPEndPoint> { host });
+			Send(message, destinations);
 		}
 
-		// Snapshots for the EOS adapter
-		public List<LanMember> Members() { lock (stateLock) { return new List<LanMember>(members); } }
-		public Dictionary<string, LanAttr> Attributes() { lock (stateLock) { return new Dictionary<string, LanAttr>(lobbyAttributes); } }
-		public LanAttr GetAttr(string key) { lock (stateLock) { LanAttr value; return lobbyAttributes.TryGetValue(key, out value) ? value : null; } }
-		public int MemberCount() { lock (stateLock) { return members.Count; } }
+		// Host only. The caller reports the member as kicked, so MemberLeft isn't raised
+		public bool Kick(string memberId)
+		{
+			IPEndPoint dest; string message;
+			lock (stateLock)
+			{
+				int index = (InLobby && IsHost) ? members.FindIndex(candidate => candidate.Id == memberId) : -1;
+				// Index 0 is the host itself
+				if (index <= 0) return false;
+				dest = members[index].Endpoint;
+				message = KickMessage(memberId, members[index].Session);
+				DropMember(index, true);
+			}
+			if (dest != null) Send(message, dest);
+			if (LobbyChanged != null) LobbyChanged();
+			return true;
+		}
 
-		// P2P packets - the EOS SendPacket/ReceivePacket back-end
-		IPEndPoint ResolveEndpoint(string peerId)   // caller holds stateLock
+		// Caller holds stateLock
+		void ClearLobby()
+		{
+			InLobby = false; IsHost = false; JoinAcknowledged = false;
+			ClearLobbyState();
+			LobbyId = null; HostId = null; hostEndpoint = null;
+		}
+
+		// Caller holds stateLock
+		void ClearLobbyState()
+		{
+			members.Clear(); lobbyAttributes.Clear(); peerEndpoints.Clear(); reliableStreams.Clear(); inbox.Clear(); droppedSessions.Clear();
+		}
+
+		// Caller holds stateLock
+		void LoseLobby(LanChanges changes)
+		{
+			ClearLobby();
+			changes.Lost = true;
+		}
+
+		// Caller holds stateLock
+		void DropMember(int index, bool kicked)
+		{
+			LanMember member = members[index];
+			members.RemoveAt(index);
+			droppedSessions[member.Id + "/" + member.Session] = kicked;
+			reliableStreams.Remove(member.Id); peerEndpoints.Remove(member.Id);
+		}
+
+		void RaiseChanges(LanChanges changes)
+		{
+			if (MemberLeft != null) foreach (string id in changes.Left) MemberLeft(id);
+			if (MemberJoined != null) foreach (string id in changes.Joined) MemberJoined(id);
+			if ((changes.LobbyChanged || changes.Left.Count > 0 || changes.Joined.Count > 0) && LobbyChanged != null) LobbyChanged();
+			if (MemberChanged != null) foreach (string id in changes.Changed) MemberChanged(id);
+			if (changes.Lost && LobbyLost != null) LobbyLost(changes.Kicked);
+		}
+
+		// Caller holds stateLock
+		string JoinMessage()
+		{
+			return Prefix + "JOIN:" + LobbyId + ":" + LocalId + ":" + localSession + ":" + ToBase64(LocalName) + ":" + LocalPlatform + ":" + SerializeAttributes(localMemberAttributes);
+		}
+
+		// Caller holds stateLock
+		string KickMessage(string clientId, int session)
+		{
+			return Prefix + "KICK:" + LobbyId + ":" + clientId + ":" + session;
+		}
+
+		// Caller holds stateLock
+		IPEndPoint ResolveEndpoint(string peerId)
 		{
 			LanMember member = members.Find(candidate => candidate.Id == peerId);
 			if (member != null && member.Endpoint != null) return member.Endpoint;
@@ -331,10 +450,11 @@ namespace Paris.Engine.EOSLan
 			return null;
 		}
 
-		ReliableStream StreamFor(string peerId)   // caller holds stateLock
+		// Caller holds stateLock
+		ReliableStream StreamFor(string peerId)
 		{
 			ReliableStream stream;
-			if (!reliableStreams.TryGetValue(peerId, out stream)) { stream = new ReliableStream(); reliableStreams[peerId] = stream; }
+			if (!reliableStreams.TryGetValue(peerId, out stream)) { stream = new ReliableStream { Epoch = ++lastEpoch }; reliableStreams[peerId] = stream; }
 			return stream;
 		}
 
@@ -344,132 +464,166 @@ namespace Paris.Engine.EOSLan
 			IPEndPoint dest;
 			lock (stateLock) { dest = ResolveEndpoint(toId); }
 			if (dest == null) return false;
-			string message = Prefix + "PKT:" + LocalId + ":" + channel + ":" + ToBase64(socketName ?? "") + ":" + Convert.ToBase64String(data);
-			Send(message, new List<IPEndPoint> { dest });
+			Send(Frame(Prefix + "PKT:" + LocalId + ":" + channel + ":" + ToBase64(socketName) + ":", data), dest);
 			return true;
 		}
 
-		// Reliable-ordered: sequence + buffer for resend until the peer acks.
 		public bool SendPacketReliable(string toId, byte channel, string socketName, byte[] data)
 		{
 			if (string.IsNullOrEmpty(toId) || data == null) return false;
-			IPEndPoint dest; string message;
+			IPEndPoint dest; byte[] datagram;
 			lock (stateLock)
 			{
 				dest = ResolveEndpoint(toId);
 				if (dest == null) return false;
 				ReliableStream stream = StreamFor(toId);
 				int seq = stream.NextOutgoingSeq++;
-				message = Prefix + "RPK:" + LocalId + ":" + channel + ":" + ToBase64(socketName ?? "") + ":" + seq + ":" + Convert.ToBase64String(data);
-				stream.Unacked[seq] = new PendingSend { ToId = toId, Message = message, LastSentMs = NowMs() };
-			}
-			Send(message, new List<IPEndPoint> { dest });
-			return true;
-		}
-
-		void ResendUnacked()   // called from SendLoop
-		{
-			List<PendingSend> due = null;
-			lock (stateLock)
-			{
+				datagram = Frame(Prefix + "RPK:" + LocalId + ":" + channel + ":" + ToBase64(socketName) + ":" + stream.Epoch + ":" + seq + ":", data);
 				long now = NowMs();
-				foreach (var stream in reliableStreams.Values)
-				{
-					foreach (var pending in stream.Unacked.Values)
-					{
-						if (now - pending.LastSentMs >= ResendMs)
-						{
-							pending.LastSentMs = now;
-							if (due == null) due = new List<PendingSend>();
-							due.Add(pending);
-						}
-					}
-				}
+				stream.Unacked[seq] = new PendingSend { Datagram = datagram, FirstSentMs = now, LastSentMs = now };
 			}
-			if (due == null) return;
-			foreach (var pending in due)
-			{
-				IPEndPoint dest;
-				lock (stateLock) { dest = ResolveEndpoint(pending.ToId); }
-				if (dest != null) Send(pending.Message, new List<IPEndPoint> { dest });
-			}
-		}
-
-		void HandleReliablePacket(string body, IPEndPoint from)
-		{
-			// RPK:<fromId>:<channel>:<socketB64>:<seq>:<payloadB64>
-			string[] fields = body.Split(new char[] { ':' }, 6);
-			if (fields.Length < 6) return;
-			byte channel; byte.TryParse(fields[2], out channel);
-			int seq; if (!int.TryParse(fields[4], out seq)) return;
-			byte[] payload;
-			try { payload = Convert.FromBase64String(fields[5]); } catch { return; }
-			// always ack - a duplicate means our previous ack was lost
-			Send(Prefix + "ACK:" + LocalId + ":" + seq, new List<IPEndPoint> { new IPEndPoint(from.Address, PORT) });
-			var packet = new LanPacket { FromId = fields[1], Channel = channel, Socket = FromBase64(fields[3]), Data = payload };
-			lock (stateLock)
-			{
-				if (!InLobby) return;
-				peerEndpoints[packet.FromId] = new IPEndPoint(from.Address, PORT);
-				LanMember member = members.Find(candidate => candidate.Id == packet.FromId);
-				if (member != null) member.LastSeenMs = NowMs();
-				ReliableStream stream = StreamFor(packet.FromId);
-				if (seq < stream.NextExpectedSeq) return;   // duplicate of something already delivered
-				if (seq == stream.NextExpectedSeq)
-				{
-					inbox.Enqueue(packet);
-					stream.NextExpectedSeq++;
-					LanPacket buffered;
-					while (stream.OutOfOrder.TryGetValue(stream.NextExpectedSeq, out buffered))   // drain any buffered run
-					{
-						stream.OutOfOrder.Remove(stream.NextExpectedSeq);
-						inbox.Enqueue(buffered);
-						stream.NextExpectedSeq++;
-					}
-					return;
-				}
-				if (stream.OutOfOrder.Count < OutOfOrderBufferCap) stream.OutOfOrder[seq] = packet;   // out of order - hold
-			}
-		}
-
-		void HandleAck(string body)
-		{
-			// ACK:<ackerId>:<seq>
-			string[] fields = body.Split(':');
-			if (fields.Length < 3) return;
-			int seq; if (!int.TryParse(fields[2], out seq)) return;
-			lock (stateLock)
-			{
-				ReliableStream stream;
-				if (reliableStreams.TryGetValue(fields[1], out stream)) stream.Unacked.Remove(seq);
-			}
+			Send(datagram, dest);
+			return true;
 		}
 
 		public LanPacket PeekPacket() { lock (stateLock) { return inbox.Count > 0 ? inbox.Peek() : null; } }
 		public LanPacket DequeuePacket() { lock (stateLock) { return inbox.Count > 0 ? inbox.Dequeue() : null; } }
 
-		void HandlePacket(string body, IPEndPoint from)
+		void ResendUnacked()
 		{
-			// PKT:<fromId>:<channel>:<socketB64>:<payloadB64>
-			string[] fields = body.Split(new char[] { ':' }, 5);
-			if (fields.Length < 5) return;
-			byte channel; byte.TryParse(fields[2], out channel);
-			byte[] payload;
-			try { payload = Convert.FromBase64String(fields[4]); } catch { return; }
-			var packet = new LanPacket { FromId = fields[1], Channel = channel, Socket = FromBase64(fields[3]), Data = payload };
+			List<KeyValuePair<IPEndPoint, byte[]>> due = null;
+			var changes = new LanChanges();
+			lock (stateLock)
+			{
+				long now = NowMs();
+				List<string> unresponsive = null;
+				foreach (var stream in reliableStreams)
+				{
+					IPEndPoint dest = ResolveEndpoint(stream.Key);
+					foreach (var pending in stream.Value.Unacked.Values)
+					{
+						if (now - pending.FirstSentMs > ReliableGiveUpMs)
+						{
+							if (unresponsive == null) unresponsive = new List<string>();
+							unresponsive.Add(stream.Key);
+							break;
+						}
+						if (dest != null && now - pending.LastSentMs >= ResendMs)
+						{
+							pending.LastSentMs = now;
+							if (due == null) due = new List<KeyValuePair<IPEndPoint, byte[]>>();
+							due.Add(new KeyValuePair<IPEndPoint, byte[]>(dest, pending.Datagram));
+						}
+					}
+				}
+				if (unresponsive != null)
+					foreach (string peerId in unresponsive) DropUnresponsive(peerId, changes);
+			}
+			RaiseChanges(changes);
+			if (due == null) return;
+			foreach (var send in due) Send(send.Value, send.Key);
+		}
+
+		// Caller holds stateLock
+		void DropUnresponsive(string peerId, LanChanges changes)
+		{
+			// Clients don't own membership, so a stream to another client just restarts
+			reliableStreams.Remove(peerId);
+			if (!InLobby) return;
+			if (IsHost)
+			{
+				int index = members.FindIndex(candidate => candidate.Id == peerId);
+				if (index > 0) { changes.Left.Add(peerId); DropMember(index, false); }
+			}
+			else if (peerId == HostId) LoseLobby(changes);
+		}
+
+		void HandleReliablePacket(byte[] datagram, IPEndPoint from)
+		{
+			string[] fields;
+			LanPacket packet = Unframe(datagram, 6, out fields);
+			if (packet == null) return;
+			int epoch, seq;
+			if (!int.TryParse(fields[4], out epoch) || !int.TryParse(fields[5], out seq)) return;
+			bool accepted;
 			lock (stateLock)
 			{
 				if (!InLobby) return;
-				if (inbox.Count > InboxFloodCap) inbox.Dequeue();   // drop oldest under flood
-				inbox.Enqueue(packet);
-				// any datagram teaches us the sender's endpoint and counts as a heartbeat
-				peerEndpoints[packet.FromId] = new IPEndPoint(from.Address, PORT);
-				LanMember member = members.Find(candidate => candidate.Id == packet.FromId);
-				if (member != null) { member.LastSeenMs = NowMs(); if (member.Endpoint == null) member.Endpoint = new IPEndPoint(from.Address, PORT); }
+				Touch(packet.FromId, from);
+				ReliableStream stream = StreamFor(packet.FromId);
+				// Left over from a stream the peer has since restarted
+				if (epoch < stream.PeerEpoch) return;
+				if (epoch > stream.PeerEpoch) { stream.PeerEpoch = epoch; stream.NextExpectedSeq = 1; stream.OutOfOrder.Clear(); }
+				accepted = AcceptReliable(stream, seq, packet);
+			}
+			// Ack only what was accepted, so anything refused gets resent
+			if (accepted) Send(Prefix + "ACK:" + LocalId + ":" + epoch + ":" + seq, new IPEndPoint(from.Address, PORT));
+		}
+
+		// Caller holds stateLock
+		bool AcceptReliable(ReliableStream stream, int seq, LanPacket packet)
+		{
+			// A duplicate means our last ack was lost
+			if (seq < stream.NextExpectedSeq || stream.OutOfOrder.ContainsKey(seq)) return true;
+			if (seq > stream.NextExpectedSeq)
+			{
+				if (stream.OutOfOrder.Count >= OutOfOrderBufferCap) return false;
+				stream.OutOfOrder[seq] = packet;
+				return true;
+			}
+			if (inbox.Count >= ReliableInboxCap) return false;
+			inbox.Enqueue(packet);
+			stream.NextExpectedSeq++;
+			// Buffered packets are acked already, so they go in even past the cap
+			LanPacket buffered;
+			while (stream.OutOfOrder.TryGetValue(stream.NextExpectedSeq, out buffered))
+			{
+				stream.OutOfOrder.Remove(stream.NextExpectedSeq);
+				inbox.Enqueue(buffered);
+				stream.NextExpectedSeq++;
+			}
+			return true;
+		}
+
+		void HandleAck(string body, IPEndPoint from)
+		{
+			string[] fields = body.Split(':');
+			if (fields.Length < 4) return;
+			int epoch, seq;
+			if (!int.TryParse(fields[2], out epoch) || !int.TryParse(fields[3], out seq)) return;
+			lock (stateLock)
+			{
+				if (!InLobby) return;
+				Touch(fields[1], from);
+				ReliableStream stream;
+				if (reliableStreams.TryGetValue(fields[1], out stream) && stream.Epoch == epoch) stream.Unacked.Remove(seq);
 			}
 		}
 
-		// Networking threads
+		void HandlePacket(byte[] datagram, IPEndPoint from)
+		{
+			string[] fields;
+			LanPacket packet = Unframe(datagram, 4, out fields);
+			if (packet == null) return;
+			lock (stateLock)
+			{
+				if (!InLobby) return;
+				Touch(packet.FromId, from);
+				// Drop the newcomer, since anything queued may be an acked reliable packet
+				if (inbox.Count < InboxFloodCap) inbox.Enqueue(packet);
+			}
+		}
+
+		// Caller holds stateLock. Any datagram counts as a heartbeat
+		void Touch(string peerId, IPEndPoint from)
+		{
+			var endpoint = new IPEndPoint(from.Address, PORT);
+			peerEndpoints[peerId] = endpoint;
+			LanMember member = members.Find(candidate => candidate.Id == peerId);
+			if (member != null) { member.LastSeenMs = NowMs(); if (member.Endpoint == null) member.Endpoint = endpoint; }
+			if (peerId == HostId) hostLastSeenMs = NowMs();
+		}
+
 		void SendLoop()
 		{
 			int ticksSinceHeartbeat = 0;
@@ -477,32 +631,66 @@ namespace Paris.Engine.EOSLan
 			{
 				try
 				{
-					ResendUnacked();   // reliable resends need finer granularity than the heartbeat
+					ResendUnacked();
 					if (++ticksSinceHeartbeat * TxTickMs >= HeartbeatMs)
 					{
 						ticksSinceHeartbeat = 0;
-						string message = null; List<IPEndPoint> destinations = null;
-						lock (stateLock)
-						{
-							// don't advertise until the lobby attributes are committed -
-							// clients validate VERSION/DLC/bucket from the snapshot
-							if (InLobby && IsHost && lobbyAttributes.Count > 0)
-							{
-								message = Prefix + "LOBBY:" + LobbyId + ":" + HostId + ":" + BuildSnapshot();
-								destinations = broadcastTargets;
-							}
-							else if (InLobby && !IsHost && hostEndpoint != null)
-							{
-								message = Prefix + "JOIN:" + LobbyId + ":" + LocalId + ":" + ToBase64(LocalName) + ":" + LocalPlatform + ":" + SerializeAttributes(localMemberAttributes);
-								destinations = new List<IPEndPoint> { hostEndpoint };
-							}
-							if (IsHost) EvictStaleMembers();
-						}
-						if (message != null) Send(message, destinations);
+						Heartbeat();
 					}
 				}
 				catch { }
 				Thread.Sleep(TxTickMs);
+			}
+		}
+
+		void Heartbeat()
+		{
+			bool hosting;
+			lock (stateLock) hosting = InLobby && IsHost;
+			// Re-read each time, since Wi-Fi may come up after Start
+			List<IPEndPoint> targets = hosting ? FindBroadcastTargets(PORT) : null;
+			string message = null; List<IPEndPoint> destinations = null;
+			var changes = new LanChanges();
+			lock (stateLock)
+			{
+				if (targets != null) broadcastTargets = targets;
+				if (InLobby && IsHost)
+				{
+					EvictStaleMembers(changes);
+					// Wait for the lobby attributes, since clients check VERSION, DLC and
+					// bucket from the snapshot
+					if (lobbyAttributes.Count > 0)
+					{
+						message = Prefix + "LOBBY:" + LobbyId + ":" + HostId + ":" + BuildSnapshot();
+						destinations = broadcastTargets;
+					}
+				}
+				else if (InLobby)
+				{
+					if (NowMs() - hostLastSeenMs > MemberTimeoutMs) LoseLobby(changes);
+					else if (hostEndpoint != null)
+					{
+						message = JoinMessage();
+						destinations = new List<IPEndPoint> { hostEndpoint };
+					}
+				}
+			}
+			RaiseChanges(changes);
+			if (message != null) Send(message, destinations);
+		}
+
+		// Caller holds stateLock
+		void EvictStaleMembers(LanChanges changes)
+		{
+			long now = NowMs();
+			// Never evict the host at index 0
+			for (int i = members.Count - 1; i >= 1; i--)
+			{
+				if (now - members[i].LastSeenMs > MemberTimeoutMs)
+				{
+					changes.Left.Add(members[i].Id);
+					DropMember(i, false);
+				}
 			}
 		}
 
@@ -513,17 +701,23 @@ namespace Paris.Engine.EOSLan
 				try
 				{
 					var from = new IPEndPoint(IPAddress.Any, 0);
-					string message = Encoding.UTF8.GetString(socket.Receive(ref from));
-					if (!message.StartsWith(Prefix)) continue;
-					string body = message.Substring(Prefix.Length);
-					int firstColon = body.IndexOf(':');
-					string verb = firstColon < 0 ? body : body.Substring(0, firstColon);
-					if (verb == "PKT") HandlePacket(body, from);
-					else if (verb == "RPK") HandleReliablePacket(body, from);
-					else if (verb == "ACK") HandleAck(body);
-					else if (verb == "LOBBY") HandleBeacon(body, from);
-					else if (verb == "JOIN") HandleJoin(body, from);
-					else if (verb == "LEAVE") HandleLeave(body);
+					byte[] datagram = socket.Receive(ref from);
+					if (!HasPrefix(datagram)) continue;
+					int colon = Array.IndexOf(datagram, (byte)':', PrefixBytes.Length);
+					if (colon < 0) continue;
+					string verb = Encoding.ASCII.GetString(datagram, PrefixBytes.Length, colon - PrefixBytes.Length);
+					if (verb == "PKT") HandlePacket(datagram, from);
+					else if (verb == "RPK") HandleReliablePacket(datagram, from);
+					else
+					{
+						string body = Encoding.UTF8.GetString(datagram, PrefixBytes.Length, datagram.Length - PrefixBytes.Length);
+						if (verb == "ACK") HandleAck(body, from);
+						else if (verb == "LOBBY") HandleBeacon(body, from);
+						else if (verb == "JOIN") HandleJoin(body, from);
+						else if (verb == "LEAVE") HandleLeave(body);
+						else if (verb == "KICK") HandleKick(body);
+						else if (verb == "CLOSE") HandleClose(body);
+					}
 				}
 				catch (Exception) { Thread.Sleep(200); }
 			}
@@ -531,125 +725,175 @@ namespace Paris.Engine.EOSLan
 
 		void HandleBeacon(string body, IPEndPoint from)
 		{
-			// LOBBY:<lobbyId>:<hostId>:<snapshotB64>
 			string[] fields = body.Split(new char[] { ':' }, 4);
 			if (fields.Length < 4) return;
 			string lobbyId = fields[1], hostId = fields[2];
-			if (hostId == LocalId) return;   // our own beacon (host) - ignore
+			// Our own beacon
+			if (hostId == LocalId) return;
 			LanLobbyInfo info = ParseSnapshot(lobbyId, hostId, fields[3], from);
-			bool joinJustAcknowledged = false;
-			var changedMembers = new List<string>();
+			var changes = new LanChanges();
 			lock (stateLock)
 			{
 				if (searching && (searchFilterId == null || searchFilterId == lobbyId))
 					searchResults[lobbyId] = info;
-				if (InLobby && !IsHost && lobbyId == LobbyId)
-				{
-					// diff member attrs so the adapter can fire member-update notifies
-					var previousById = new Dictionary<string, LanMember>();
-					foreach (var member in members) previousById[member.Id] = member;
-					foreach (var member in info.Members)
-					{
-						LanMember previous;
-						if (previousById.TryGetValue(member.Id, out previous) && !AttributesEqual(previous.Attributes, member.Attributes))
-							changedMembers.Add(member.Id);
-					}
-					// refresh our view from the host's authoritative snapshot
-					members.Clear(); foreach (var member in info.Members) members.Add(member);
-					lobbyAttributes.Clear(); foreach (var attr in info.Attributes) lobbyAttributes[attr.Key] = attr.Value;
-					MaxMembers = info.MaxMembers; Bucket = info.Bucket;
-					if (info.Members.Count > 0) hostEndpoint = info.Members[0].Endpoint ?? hostEndpoint;
-					// keep our own freshest attrs (heartbeat may lag a beacon)
-					LanMember self = members.Find(candidate => candidate.Id == LocalId);
-					if (self != null)
-						foreach (var attr in localMemberAttributes) self.Attributes[attr.Key] = attr.Value;
-					bool amMember = info.Members.Exists(member => member.Id == LocalId);
-					if (amMember && !JoinAcknowledged) { JoinAcknowledged = true; joinJustAcknowledged = true; }
-				}
+				if (InLobby && !IsHost && lobbyId == LobbyId && hostId == HostId)
+					AdoptSnapshot(info, changes);
 			}
-			if (LobbyChanged != null) LobbyChanged();
-			if (joinJustAcknowledged && LobbyChanged != null) LobbyChanged();
-			if (MemberChanged != null)
-				foreach (string id in changedMembers) MemberChanged(id);
+			RaiseChanges(changes);
+		}
+
+		// Caller holds stateLock. Diffs the host's snapshot against ours, then takes it
+		void AdoptSnapshot(LanLobbyInfo info, LanChanges changes)
+		{
+			hostLastSeenMs = NowMs();
+			bool amMember = info.Members.Exists(member => member.Id == LocalId && member.Session == localSession);
+			if (JoinAcknowledged && !amMember)
+			{
+				// The host dropped us, e.g. a timeout, or a kick whose KICK was lost
+				LoseLobby(changes);
+				return;
+			}
+			if (amMember && !JoinAcknowledged) { JoinAcknowledged = true; changes.LobbyChanged = true; }
+			var previousById = new Dictionary<string, LanMember>();
+			foreach (var member in members)
+				if (member.Id != LocalId) previousById[member.Id] = member;
+			foreach (var member in info.Members)
+			{
+				if (member.Id == LocalId) continue;
+				LanMember previous;
+				if (!previousById.TryGetValue(member.Id, out previous)) { changes.Joined.Add(member.Id); continue; }
+				previousById.Remove(member.Id);
+				if (previous.Session != member.Session)
+				{
+					// Left and came back between beacons
+					changes.Left.Add(member.Id); changes.Joined.Add(member.Id);
+					reliableStreams.Remove(member.Id);
+				}
+				else if (!AttributesEqual(previous.Attributes, member.Attributes))
+					changes.Changed.Add(member.Id);
+			}
+			foreach (var gone in previousById.Values)
+			{
+				changes.Left.Add(gone.Id);
+				reliableStreams.Remove(gone.Id); peerEndpoints.Remove(gone.Id);
+			}
+			if (MaxMembers != info.MaxMembers || Bucket != info.Bucket || !AttributesEqual(lobbyAttributes, info.Attributes))
+				changes.LobbyChanged = true;
+			// Copies, so the live list never shares objects with a search result
+			members.Clear(); foreach (var member in info.Members) members.Add(member.Clone());
+			lobbyAttributes.Clear(); foreach (var attr in info.Attributes) lobbyAttributes[attr.Key] = attr.Value;
+			MaxMembers = info.MaxMembers; Bucket = info.Bucket;
+			if (info.Members.Count > 0) hostEndpoint = info.Members[0].Endpoint ?? hostEndpoint;
+			// Our own attributes win, since the beacon may predate our last heartbeat
+			LanMember self = members.Find(candidate => candidate.Id == LocalId);
+			if (self != null)
+				foreach (var attr in localMemberAttributes) self.Attributes[attr.Key] = attr.Value;
 		}
 
 		void HandleJoin(string body, IPEndPoint from)
 		{
-			// JOIN:<lobbyId>:<clientId>:<nameB64>:<plat>[:<attrsB64>]
 			string[] fields = body.Split(':');
-			if (fields.Length < 5) return;
-			string lobbyId = fields[1], clientId = fields[2], name = FromBase64(fields[3]);
-			int platform; int.TryParse(fields[4], out platform);
-			Dictionary<string, LanAttr> memberAttributes = (fields.Length >= 6) ? ParseAttributes(fields[5]) : new Dictionary<string, LanAttr>();
-			LanMember joined = null; bool attributesChanged = false;
+			if (fields.Length < 7) return;
+			string lobbyId = fields[1], clientId = fields[2], name = FromBase64(fields[4]);
+			int session; if (!int.TryParse(fields[3], out session)) return;
+			int platform; int.TryParse(fields[5], out platform);
+			Dictionary<string, LanAttr> memberAttributes = ParseAttributes(fields[6]);
+			var changes = new LanChanges();
+			string kickMessage = null;
 			lock (stateLock)
 			{
 				if (!IsHost || !InLobby || lobbyId != LobbyId) return;
-				peerEndpoints[clientId] = new IPEndPoint(from.Address, PORT);
-				LanMember member = members.Find(candidate => candidate.Id == clientId);
-				if (member == null)
+				bool kicked;
+				if (droppedSessions.TryGetValue(clientId + "/" + session, out kicked))
 				{
-					if (members.Count >= MaxMembers) return;   // full
-					member = new LanMember { Id = clientId, Name = name, Platform = platform };
-					member.Endpoint = new IPEndPoint(from.Address, PORT);
-					member.LastSeenMs = NowMs();
-					foreach (var attr in memberAttributes) member.Attributes[attr.Key] = attr.Value;
-					members.Add(member);
-					joined = member;
+					// Repeat a KICK the client may have missed
+					if (kicked) kickMessage = KickMessage(clientId, session);
 				}
 				else
 				{
-					member.LastSeenMs = NowMs(); member.Name = name; member.Endpoint = new IPEndPoint(from.Address, PORT);
-					if (!AttributesEqual(member.Attributes, memberAttributes))
+					int index = members.FindIndex(candidate => candidate.Id == clientId);
+					// Back under a new session before the old one timed out
+					if (index > 0 && members[index].Session != session) { changes.Left.Add(clientId); DropMember(index, false); index = -1; }
+					if (index < 0 && members.Count < MaxMembers)
 					{
-						member.Attributes.Clear();
+						var member = new LanMember { Id = clientId, Name = name, Platform = platform, Session = session };
 						foreach (var attr in memberAttributes) member.Attributes[attr.Key] = attr.Value;
-						attributesChanged = true;
+						members.Add(member);
+						changes.Joined.Add(clientId);
 					}
+					else if (index > 0)
+					{
+						LanMember member = members[index];
+						member.Name = name; member.Endpoint = new IPEndPoint(from.Address, PORT);
+						if (!AttributesEqual(member.Attributes, memberAttributes))
+						{
+							member.Attributes.Clear();
+							foreach (var attr in memberAttributes) member.Attributes[attr.Key] = attr.Value;
+							changes.Changed.Add(clientId);
+						}
+					}
+					Touch(clientId, from);
 				}
 			}
-			if (joined != null && MemberJoined != null) MemberJoined(joined);
-			if (joined != null && LobbyChanged != null) LobbyChanged();
-			if (attributesChanged && MemberChanged != null) MemberChanged(clientId);
+			if (kickMessage != null) Send(kickMessage, new IPEndPoint(from.Address, PORT));
+			RaiseChanges(changes);
 		}
 
 		void HandleLeave(string body)
 		{
 			string[] fields = body.Split(':');
-			if (fields.Length < 3) return;
-			string lobbyId = fields[1], clientId = fields[2]; bool removed = false;
+			if (fields.Length < 4) return;
+			string lobbyId = fields[1], clientId = fields[2];
+			int session; if (!int.TryParse(fields[3], out session)) return;
+			var changes = new LanChanges();
 			lock (stateLock)
 			{
 				if (!IsHost || lobbyId != LobbyId) return;
-				int index = members.FindIndex(candidate => candidate.Id == clientId);
-				if (index >= 0) { members.RemoveAt(index); removed = true; reliableStreams.Remove(clientId); peerEndpoints.Remove(clientId); }
+				int index = members.FindIndex(candidate => candidate.Id == clientId && candidate.Session == session);
+				if (index > 0) { changes.Left.Add(clientId); DropMember(index, false); }
 			}
-			if (removed && MemberLeft != null) MemberLeft(clientId);
-			if (removed && LobbyChanged != null) LobbyChanged();
+			RaiseChanges(changes);
 		}
 
-		void EvictStaleMembers()   // caller holds stateLock
+		void HandleKick(string body)
 		{
-			long now = NowMs();
-			for (int i = members.Count - 1; i >= 1; i--)   // never evict host (index 0)
+			string[] fields = body.Split(':');
+			if (fields.Length < 4) return;
+			int session; if (!int.TryParse(fields[3], out session)) return;
+			var changes = new LanChanges();
+			lock (stateLock)
 			{
-				if (now - members[i].LastSeenMs > MemberTimeoutMs)
+				if (InLobby && !IsHost && fields[1] == LobbyId && fields[2] == LocalId && session == localSession)
 				{
-					string goneId = members[i].Id;
-					members.RemoveAt(i);
-					reliableStreams.Remove(goneId); peerEndpoints.Remove(goneId);
-					if (MemberLeft != null) ThreadPool.QueueUserWorkItem(delegate { MemberLeft(goneId); });
+					LoseLobby(changes);
+					changes.Kicked = true;
 				}
 			}
+			RaiseChanges(changes);
 		}
 
-		// Snapshot (de)serialization
-		string BuildSnapshot()   // caller holds stateLock
+		void HandleClose(string body)
+		{
+			string[] fields = body.Split(':');
+			if (fields.Length < 3) return;
+			string lobbyId = fields[1], hostId = fields[2];
+			var changes = new LanChanges();
+			lock (stateLock)
+			{
+				LanLobbyInfo listed;
+				if (searchResults.TryGetValue(lobbyId, out listed) && listed.HostId == hostId) searchResults.Remove(lobbyId);
+				if (InLobby && !IsHost && lobbyId == LobbyId && hostId == HostId) LoseLobby(changes);
+			}
+			RaiseChanges(changes);
+		}
+
+		// Caller holds stateLock
+		string BuildSnapshot()
 		{
 			var builder = new StringBuilder();
 			builder.Append("H|").Append(MaxMembers).Append('|').Append(ToBase64(Bucket)).Append('\n');
 			foreach (var member in members)
-				builder.Append("M|").Append(member.Id).Append('|').Append(ToBase64(member.Name)).Append('|').Append(member.Platform)
+				builder.Append("M|").Append(member.Id).Append('|').Append(member.Session).Append('|').Append(ToBase64(member.Name)).Append('|').Append(member.Platform)
 				       .Append('|').Append(member.Endpoint != null ? member.Endpoint.Address.ToString() : "-")
 				       .Append('|').Append(SerializeAttributes(member.Attributes)).Append('\n');
 			foreach (var attr in lobbyAttributes)
@@ -671,17 +915,20 @@ namespace Paris.Engine.EOSLan
 					uint.TryParse(parts[1], out info.MaxMembers);
 					info.Bucket = FromBase64(parts[2]);
 				}
-				else if (parts[0] == "M" && parts.Length >= 4)
+				else if (parts[0] == "M" && parts.Length >= 5)
 				{
-					int platform; int.TryParse(parts[3], out platform);
-					var member = new LanMember { Id = parts[1], Name = FromBase64(parts[2]), Platform = platform };
-					if (parts.Length >= 5 && parts[4] != "-")   // host publishes each member's address for peer P2P
+					int session; int.TryParse(parts[2], out session);
+					int platform; int.TryParse(parts[4], out platform);
+					var member = new LanMember { Id = parts[1], Session = session, Name = FromBase64(parts[3]), Platform = platform };
+					// The host publishes each member's address for client-to-client P2P
+					if (parts.Length >= 6 && parts[5] != "-")
 					{
-						try { member.Endpoint = new IPEndPoint(IPAddress.Parse(parts[4]), PORT); } catch { }
+						try { member.Endpoint = new IPEndPoint(IPAddress.Parse(parts[5]), PORT); } catch { }
 					}
-					if (parts.Length >= 6)
-						foreach (var attr in ParseAttributes(parts[5])) member.Attributes[attr.Key] = attr.Value;
-					if (firstMember) { member.Endpoint = new IPEndPoint(from.Address, PORT); firstMember = false; }   // member[0] is the host (beacon source is authoritative)
+					if (parts.Length >= 7)
+						foreach (var attr in ParseAttributes(parts[6])) member.Attributes[attr.Key] = attr.Value;
+					// Member 0 is the host, and the beacon's source address beats the published one
+					if (firstMember) { member.Endpoint = new IPEndPoint(from.Address, PORT); firstMember = false; }
 					info.Members.Add(member);
 				}
 				else if (parts[0] == "A" && parts.Length >= 4)
@@ -693,7 +940,6 @@ namespace Paris.Engine.EOSLan
 		static string ToBase64(string text) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(text ?? "")); }
 		static string FromBase64(string base64) { try { return Encoding.UTF8.GetString(Convert.FromBase64String(base64)); } catch { return ""; } }
 
-		// member-attr blob: newline-separated "key|type|valueB64" records, base64'd as a whole
 		static string SerializeAttributes(Dictionary<string, LanAttr> attributes)
 		{
 			if (attributes == null || attributes.Count == 0) return ToBase64("");
@@ -728,28 +974,53 @@ namespace Paris.Engine.EOSLan
 			return true;
 		}
 
+		static bool HasPrefix(byte[] datagram)
+		{
+			if (datagram.Length < PrefixBytes.Length) return false;
+			for (int i = 0; i < PrefixBytes.Length; i++)
+				if (datagram[i] != PrefixBytes[i]) return false;
+			return true;
+		}
+
+		static byte[] Frame(string header, byte[] payload)
+		{
+			byte[] head = Encoding.UTF8.GetBytes(header);
+			byte[] datagram = new byte[head.Length + payload.Length];
+			Buffer.BlockCopy(head, 0, datagram, 0, head.Length);
+			Buffer.BlockCopy(payload, 0, datagram, head.Length, payload.Length);
+			return datagram;
+		}
+
+		// Splits off the verb and the header fields after it; the payload is whatever follows the last one
+		static LanPacket Unframe(byte[] datagram, int fieldCount, out string[] fields)
+		{
+			fields = new string[fieldCount];
+			int start = PrefixBytes.Length;
+			for (int i = 0; i < fieldCount; i++)
+			{
+				int colon = Array.IndexOf(datagram, (byte)':', start);
+				if (colon < 0) return null;
+				fields[i] = Encoding.UTF8.GetString(datagram, start, colon - start);
+				start = colon + 1;
+			}
+			byte channel; byte.TryParse(fields[2], out channel);
+			var payload = new byte[datagram.Length - start];
+			Buffer.BlockCopy(datagram, start, payload, 0, payload.Length);
+			return new LanPacket { FromId = fields[1], Channel = channel, Socket = FromBase64(fields[3]), Data = payload };
+		}
+
 		void Send(string message, List<IPEndPoint> destinations)
 		{
-			byte[] bytes = Encoding.UTF8.GetBytes(message);
-			foreach (var dest in destinations) { try { socket.Send(bytes, bytes.Length, dest); } catch { } }
+			byte[] datagram = Encoding.UTF8.GetBytes(message);
+			foreach (var dest in destinations) Send(datagram, dest);
 		}
 
-		string GenerateLobbyCode()
-		{
-			// short, human-typeable party code (for "Join Party Code")
-			const string Alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-			var builder = new StringBuilder();
-			int seed = Environment.TickCount ^ (LocalId != null ? LocalId.GetHashCode() : 0);
-			for (int i = 0; i < 6; i++)
-			{
-				seed = seed * 1103515245 + 12345;
-				builder.Append(Alphabet[((seed >> 16) & 0x7fff) % Alphabet.Length]);
-			}
-			return builder.ToString();
-		}
+		void Send(string message, IPEndPoint dest) { Send(Encoding.UTF8.GetBytes(message), dest); }
+
+		void Send(byte[] datagram, IPEndPoint dest) { try { socket.Send(datagram, datagram.Length, dest); } catch { } }
 
 		// Every up, non-loopback IPv4 interface's directed broadcast, plus the global
-		// 255.255.255.255 - covers multi-subnet setups and odd adapters alike.
+		// 255.255.255.255, to cover multi-subnet setups and odd adapters
 		static List<IPEndPoint> FindBroadcastTargets(int port)
 		{
 			var targets = new List<IPEndPoint> { new IPEndPoint(IPAddress.Broadcast, port) };
