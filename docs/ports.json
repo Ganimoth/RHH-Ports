@@ -2092,15 +2092,15 @@
       "min_glibc": null
     },
     "source": {
-      "screenshot_url": "https://raw.githubusercontent.com/JeodC/RHH-Ports/main/ports/released/harbourmasters/lighthouse/lighthouse/screenshot.png",
-      "readme_url": "https://raw.githubusercontent.com/JeodC/RHH-Ports/main/ports/released/harbourmasters/lighthouse/lighthouse/README.md",
-      "download_url": "https://github.com/JeodC/RHH-Ports/releases/download/ports-latest/lighthouse.zip",
-      "date_updated": "2026-10-27T10:18",
+      "screenshot_url": "https://raw.githubusercontent.com/Ganimoth/RHH-Ports/main/ports/released/harbourmasters/lighthouse/lighthouse/screenshot.png",
+      "readme_url": "https://raw.githubusercontent.com/Ganimoth/RHH-Ports/main/ports/released/harbourmasters/lighthouse/lighthouse/README.md",
+      "download_url": "https://github.com/Ganimoth/RHH-Ports/releases/download/ports-latest/lighthouse.zip",
+      "date_updated": "2026-10-31T10:50",
       "first_seen": "2026-07-31",
-      "md5": "f8ad0fde299fb1756edfed04b9866509",
-      "size": 8333717,
+      "md5": "8185a1a06e014a5cfac435ee40e55cd4",
+      "size": 8348368,
       "lifetime_downloads": 670,
-      "last_commit": "[LIGHTHOUSE] Update to 1.2.1"
+      "last_commit": "[LIGHTHOUSE] Update to 1.2.2"
     }
   },
   {
